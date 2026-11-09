@@ -1,0 +1,22 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: dmsx-e2e
+      MYSQL_DATABASE: shop
+    ports:
+      - "127.0.0.1:13306:3306"
+    command:
+      - --log-bin=binlog
+      - --binlog-format=ROW
+      - --server-id=1
+      - --gtid-mode=ON
+      - --enforce-gtid-consistency=ON
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/01-shop.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pdmsx-e2e"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+      start_period: 20s
