@@ -327,6 +327,145 @@ func ghOstPath() string {
 	return path
 }
 
+func TestMySQLBackupRestoreRoundTrip(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Fatal("docker is required")
+	}
+	if err := compose("up", "-d", "--wait"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = compose("down", "-v") })
+
+	root, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := t.TempDir()
+	archives := t.TempDir()
+	bin := filepath.Join(t.TempDir(), "dmsx")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/dmsx")
+	build.Dir = root
+	build.Stdout, build.Stderr = os.Stdout, os.Stderr
+	if err := build.Run(); err != nil {
+		t.Fatal(err)
+	}
+	server := exec.Command(bin)
+	server.Env = append(os.Environ(), "DMSX_ADDR=127.0.0.1:18080", "DMSX_DATA="+data)
+	server.Stdout, server.Stderr = os.Stdout, os.Stderr
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = server.Process.Kill()
+		_, _ = server.Process.Wait()
+	})
+	waitHealthy(t, "http://127.0.0.1:18080/api/health")
+	sessionCookie = ""
+	signIn(t)
+
+	database := postJSON(t, "/api/databases", map[string]any{
+		"name": "shop", "engine": "mysql", "host": "127.0.0.1", "port": 13306,
+		"username": "root", "password": "dmsx-e2e", "database": "shop", "version": "8.4",
+	})
+	storage := postJSON(t, "/api/storages", map[string]any{
+		"name": "local", "type": "LOCAL", "settings": map[string]string{"path": archives},
+	})
+	postOK(t, "/api/databases/"+database["id"].(string)+"/test", nil)
+	postOK(t, "/api/storages/"+storage["id"].(string)+"/test", nil)
+
+	mysqlExec(t, `CREATE TABLE events (
+		id BIGINT NOT NULL PRIMARY KEY,
+		kind VARCHAR(32) NOT NULL,
+		amount INT NOT NULL,
+		create_time DATETIME NOT NULL
+	) ENGINE=InnoDB`)
+	mysqlExec(t, `SET SESSION cte_max_recursion_depth = 500000;
+		INSERT INTO events (id, kind, amount, create_time)
+		WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 12000)
+		SELECT n, IF(n % 2 = 0, 'even', 'odd'), n, '2024-03-01 00:00:00' FROM seq`)
+	mysqlExec(t, `CREATE TABLE secret_notes (
+		id INT NOT NULL PRIMARY KEY,
+		body VARCHAR(64) NOT NULL
+	) ENGINE=InnoDB`)
+	mysqlExec(t, `INSERT INTO secret_notes (id, body) VALUES (1, 'classified')`)
+
+	config := postJSON(t, "/api/backups/configs", map[string]any{
+		"name": "nightly", "databaseId": database["id"], "storageId": storage["id"],
+		"method":        "logical",
+		"schedule":      map[string]string{"type": "HOURLY"},
+		"retention":     map[string]any{"kind": "COUNT", "count": 7},
+		"encrypted":     true,
+		"excludeTables": []string{"secret_notes"},
+	})
+	run := postJSON(t, "/api/backups/configs/"+config["id"].(string)+"/run", nil)
+	finished := waitRun(t, run["id"].(string))
+	if finished["status"] != "success" {
+		t.Fatalf("backup %+v", finished)
+	}
+	if finished["encrypted"] != true {
+		t.Fatalf("backup was not encrypted: %+v", finished)
+	}
+
+	// The stored object is the encrypted stream, not the plain SQL.
+	fileName, _ := finished["fileName"].(string)
+	stored, err := os.ReadFile(filepath.Join(archives, fileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(stored, []byte("DMSXBK01")) {
+		t.Fatalf("the stored object is not an encrypted stream: %q", truncate(stored))
+	}
+	if bytes.Contains(stored, []byte("CREATE TABLE")) {
+		t.Fatal("the stored object still holds plain SQL")
+	}
+
+	mysqlExec(t, "CREATE DATABASE shop_restored")
+	restore := postJSON(t, "/api/backups/runs/"+finished["id"].(string)+"/restore", map[string]any{
+		"host": "127.0.0.1", "port": 13306, "username": "root", "password": "dmsx-e2e",
+		"database": "shop_restored", "verify": true,
+	})
+	restored := waitRestore(t, restore["id"].(string))
+	if restored["status"] != "success" {
+		t.Fatalf("restore %+v", restored)
+	}
+	if report, _ := restored["report"].(string); report != "tables=2" {
+		t.Fatalf("restore report %q", report)
+	}
+
+	if rows := mysqlScalar(t, "SELECT COUNT(*) FROM shop_restored.orders"); rows != "3" {
+		t.Fatalf("restored orders %s", rows)
+	}
+	if rows := mysqlScalar(t, "SELECT COUNT(*) FROM shop_restored.events"); rows != "12000" {
+		t.Fatalf("restored events %s", rows)
+	}
+	if wrong := mysqlScalar(t, "SELECT COUNT(*) FROM shop_restored.events WHERE kind <> IF(id % 2 = 0, 'even', 'odd')"); wrong != "0" {
+		t.Fatalf("%s restored rows lost their value", wrong)
+	}
+	if tables := mysqlScalar(t, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='shop_restored' AND table_name='secret_notes'"); tables != "0" {
+		t.Fatal("the excluded table was restored")
+	}
+
+	// The target password was used for that restore and was not kept.
+	if strings.Contains(string(get(t, "/api/backups/restores")), "dmsx-e2e") {
+		t.Fatal("the restore kept the target password")
+	}
+}
+
+func waitRestore(t *testing.T, id string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(120 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, row := range getArray(t, "/api/backups/restores") {
+			if row["id"] == id && row["status"] != "running" {
+				return row
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	t.Fatal("restore did not finish")
+	return nil
+}
+
 func waitDDL(t *testing.T, id string) map[string]any {
 	t.Helper()
 	deadline := time.Now().Add(180 * time.Second)
