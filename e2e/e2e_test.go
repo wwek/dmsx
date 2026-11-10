@@ -561,6 +561,89 @@ func TestMySQLArchiveToS3AndColdQuery(t *testing.T) {
 	}
 }
 
+func TestMySQLArchiveToQiniuAndColdQuery(t *testing.T) {
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Fatal("docker is required")
+	}
+	if err := compose("up", "-d", "--wait"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = compose("down", "-v") })
+
+	root, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := t.TempDir()
+	bin := filepath.Join(t.TempDir(), "dmsx")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/dmsx")
+	build.Dir = root
+	build.Stdout, build.Stderr = os.Stdout, os.Stderr
+	if err := build.Run(); err != nil {
+		t.Fatal(err)
+	}
+	server := exec.Command(bin)
+	server.Env = append(os.Environ(), "DMSX_ADDR=127.0.0.1:18080", "DMSX_DATA="+data)
+	server.Stdout, server.Stderr = os.Stdout, os.Stderr
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = server.Process.Kill()
+		_, _ = server.Process.Wait()
+	})
+	waitHealthy(t, "http://127.0.0.1:18080/api/health")
+	sessionCookie = ""
+	signIn(t)
+
+	bucket := newS3Server(t)
+	database := postJSON(t, "/api/databases", map[string]any{
+		"name": "shop", "engine": "mysql", "host": "127.0.0.1", "port": 13306,
+		"username": "root", "password": "dmsx-e2e", "database": "shop", "version": "8.4",
+	})
+	storage := postJSON(t, "/api/storages", map[string]any{
+		"name": "qiniu", "type": "QINIU",
+		"settings": map[string]any{
+			"bucket": "qiniu-archive", "region": "cn-east-1", "endpoint": bucket.endpoint(),
+			"accessKey": "dmsx", "secretKey": "dmsx-secret", "prefix": "qi",
+		},
+	})
+	postOK(t, "/api/databases/"+database["id"].(string)+"/test", nil)
+	postOK(t, "/api/storages/"+storage["id"].(string)+"/test", nil)
+
+	job := postJSON(t, "/api/archive/jobs", map[string]any{
+		"databaseId": database["id"], "storageId": storage["id"],
+		"table": "orders", "where": "create_time < '2025-01-01'", "year": 2024,
+		"batchSize": 5000, "deleteAfter": true,
+	})
+	archived := waitArchive(t, job["id"].(string))
+	if archived["status"] != "success" {
+		t.Fatalf("archive %+v", archived)
+	}
+	if archived["rowsArchived"].(float64) != 2 || archived["rowsDeleted"].(float64) != 2 {
+		t.Fatalf("archive counts %+v", archived)
+	}
+
+	keys := bucket.keys("qiniu-archive")
+	if len(keys) != 1 {
+		t.Fatalf("objects %v", keys)
+	}
+	if !strings.HasPrefix(keys[0], "qi/dms_archives/shop/orders/2024_archive_") || !strings.HasSuffix(keys[0], ".parquet") {
+		t.Fatalf("object key %v", keys[0])
+	}
+	if left := mysqlCount(t); left != "1" {
+		t.Fatalf("rows left in mysql: %s", left)
+	}
+
+	rows := postColdRows(t, "/api/cold-query", map[string]any{
+		"databaseId": database["id"], "storageId": storage["id"],
+		"table": "orders", "where": "id = 1", "limit": 100,
+	})
+	if len(rows) != 1 || fmt.Sprint(rows[0]["note"]) != "old-a" {
+		t.Fatalf("cold query %#v", rows)
+	}
+}
+
 func waitRestore(t *testing.T, id string) map[string]any {
 	t.Helper()
 	deadline := time.Now().Add(120 * time.Second)

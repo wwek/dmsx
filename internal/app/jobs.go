@@ -251,7 +251,13 @@ func (a *App) applyRetention(ctx context.Context, cfg BackupConfig) {
 	var items []retention.Item
 	byID := map[string]BackupRun{}
 	for _, run := range runs {
-		if run.ConfigID != cfg.ID || run.Status != "success" {
+		if run.ConfigID != cfg.ID {
+			continue
+		}
+		// A count and a GFS policy keep the failed and the cancelled runs and
+		// only count the completed ones. A time window drops every run that
+		// is older than the window, whatever its status was.
+		if run.Status != "success" && cfg.Retention.Kind != retention.KindTime {
 			continue
 		}
 		id, err := uuid.Parse(run.ID)
