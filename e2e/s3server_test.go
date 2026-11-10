@@ -25,12 +25,19 @@ import (
 // make, so the storage prefix path can be proven without a bucket service.
 type s3Server struct {
 	mu      sync.Mutex
-	objects map[string][]byte
+	objects map[string]s3Object
 	server  *httptest.Server
 }
 
+// s3Object is one stored object. The modification time belongs to the object,
+// so the listing and the read report the same one.
+type s3Object struct {
+	body       []byte
+	modifiedAt time.Time
+}
+
 func newS3Server(t *testing.T) *s3Server {
-	s := &s3Server{objects: map[string][]byte{}}
+	s := &s3Server{objects: map[string]s3Object{}}
 	s.server = httptest.NewServer(http.HandlerFunc(s.handle))
 	t.Cleanup(s.server.Close)
 	return s
@@ -90,7 +97,7 @@ func (s *s3Server) putObject(w http.ResponseWriter, r *http.Request, name string
 		return
 	}
 	s.mu.Lock()
-	s.objects[name] = body
+	s.objects[name] = s3Object{body: body, modifiedAt: time.Now().UTC().Truncate(time.Second)}
 	s.mu.Unlock()
 	sum := md5.Sum(body)
 	w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
@@ -99,20 +106,20 @@ func (s *s3Server) putObject(w http.ResponseWriter, r *http.Request, name string
 
 func (s *s3Server) getObject(w http.ResponseWriter, name string, withBody bool) {
 	s.mu.Lock()
-	body, ok := s.objects[name]
+	object, ok := s.objects[name]
 	s.mu.Unlock()
 	if !ok {
 		http.Error(w, "NoSuchKey", http.StatusNotFound)
 		return
 	}
-	sum := md5.Sum(body)
+	sum := md5.Sum(object.body)
 	w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+	w.Header().Set("Content-Length", strconv.Itoa(len(object.body)))
+	w.Header().Set("Last-Modified", object.modifiedAt.Format(http.TimeFormat))
 	w.WriteHeader(http.StatusOK)
 	if withBody {
-		_, _ = w.Write(body)
+		_, _ = w.Write(object.body)
 	}
 }
 
@@ -157,8 +164,9 @@ func (s *s3Server) listBucket(w http.ResponseWriter, r *http.Request, bucket str
 	for _, name := range names {
 		key := strings.TrimPrefix(name, bucket+"/")
 		s.mu.Lock()
-		size := len(s.objects[name])
+		object := s.objects[name]
 		s.mu.Unlock()
+		size := len(object.body)
 		if delimiter != "" {
 			if rest := strings.TrimPrefix(key, prefix); strings.Contains(rest, delimiter) {
 				common := prefix + rest[:strings.Index(rest, delimiter)+len(delimiter)]
@@ -171,7 +179,7 @@ func (s *s3Server) listBucket(w http.ResponseWriter, r *http.Request, bucket str
 		}
 		result.Contents = append(result.Contents, listContent{
 			Key:          key,
-			LastModified: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+			LastModified: object.modifiedAt.Format("2006-01-02T15:04:05.000Z"),
 			ETag:         `"` + etagOf(s, name) + `"`,
 			Size:         size,
 			StorageClass: "STANDARD",
@@ -201,7 +209,7 @@ func (s *s3Server) listBucket(w http.ResponseWriter, r *http.Request, bucket str
 func etagOf(s *s3Server, name string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	sum := md5.Sum(s.objects[name])
+	sum := md5.Sum(s.objects[name].body)
 	return hex.EncodeToString(sum[:])
 }
 
