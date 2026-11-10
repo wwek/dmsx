@@ -48,7 +48,7 @@ func TestCreateDatabaseAndStorage(t *testing.T) {
 	request = httptest.NewRequest(http.MethodGet, "/", nil)
 	response = httptest.NewRecorder()
 	handler.ServeHTTP(response, request)
-	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte("emblem")) {
+	if response.Code != http.StatusOK || !bytes.Contains(response.Body.Bytes(), []byte("id=\"root\"")) || !bytes.Contains(response.Body.Bytes(), []byte("/assets/")) {
 		t.Fatalf("index %d %s", response.Code, response.Body.String())
 	}
 	request = httptest.NewRequest(http.MethodGet, "/favicon.svg", nil)

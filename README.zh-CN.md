@@ -12,7 +12,7 @@
 
 ## 免责声明
 
-dmsx 会导出、删除和替换你指定数据库里的数据。归档确认完成后，会从主库删掉已经归档的行。在线改表会把正在使用的表换掉。存储配错、备份中断，或恢复之前没有自己验证过，数据都可能找不回来。
+dmsx 会导出、删除和替换你指定数据库里的数据。归档确认完成后，会从主库删掉已经归档的行。大表 DDL 会把正在使用的表换掉。存储配错、备份中断，或恢复之前没有自己验证过，数据都可能找不回来。
 
 使用即表示数据丢失、损坏和无法恢复的后果由操作者自行承担。作者和贡献者不作任何保证，也不接受「用了 dmsx，数据没了」这类追责。先在副本上验证备份和恢复，再对生产库做删除或切表。
 
@@ -42,7 +42,7 @@ dmsx 会导出、删除和替换你指定数据库里的数据。归档确认完
 
 ## 开始使用
 
-选一种方式启动，然后打开 http://127.0.0.1:8080 。第一次在页面上设置口令，之后用这个口令登录。再添加数据库和存储，然后创建备份、归档或结构变更。
+选一种方式启动，然后打开 http://127.0.0.1:8080 。第一次在页面上设置口令，之后用这个口令登录。再添加数据库，点进这个库，然后做备份、归档或大表 DDL。
 
 ### 下载二进制
 
@@ -73,9 +73,10 @@ docker run -d --name dmsx \
 | --- | --- |
 | 数据库 | MySQL、MariaDB、PostgreSQL（逻辑备份与物理备份）、MongoDB |
 | 存储 | S3、七牛、本地目录、SFTP、FTP、Azure Blob、Google Drive、SMB、rclone |
-| 可以做的事 | 定时备份、保留清理、恢复、单表归档、历史查询、在线改表 |
+| 可以做的事 | 定时备份、保留清理、恢复、单表归档、历史查询、大表 DDL |
 | 页面地址 | 默认 `127.0.0.1:8080`，用 `DMSX_ADDR` 修改 |
 | 数据目录 | `DMSX_DATA`。二进制默认 `./data`，容器里是 `/var/lib/dmsx` |
+| 元数据仓库（repo） | 数据目录里的 SQLite（连接、计划、运行记录）。备份内容不进元数据仓库（repo） |
 | 登录 | 单人口令。哈希存在数据目录的库里，会话放在浏览器 cookie。口令不写进配置文件，也不用环境变量 |
 
 二进制运行时，本机需要有 `mysqldump`、`mariadb-dump`、`pg_dump`、`pg_basebackup`、`mongodump`。`scripts/package.sh` 打包时会下载 [gh-ost](https://github.com/github/gh-ost) 的官方发布包，校验后编进 `dist/dmsx`，并在 `dist/gh-ost` 再放一份。`pt-online-schema-change` 仍要单独安装。可以用 `DMSX_MYSQLDUMP`、`DMSX_GH_OST` 这类变量指定路径。
@@ -86,9 +87,7 @@ docker run -d --name dmsx \
 
 导出工具的标准输出走同一条管道：`mysqldump` / `mariadb-dump` / `pg_dump` / `pg_basebackup` / `mongodump` → 明文 SQL 再 zstd → 可选 AES-GCM → 存储。加密文件头是 `DMSXBK01`。
 
-S3 和七牛同一时刻只传一块 16 MiB，满 1000 块就换下一个对象，最后写 manifest。PostgreSQL 物理备份是 `pg_basebackup --pgdata=- --format=tar`。密码写在权限 `0600` 的客户端配置里，不放进进程参数。SSH 只做本地端口转发。从未跑过的计划会立刻视为到期。
-
-这条路径按 [Databasus](https://github.com/databasus/databasus) 已公开的设计重写，没有搬它的源码。文件不能和 Databasus 的备份互换。说明见 [NOTICE.md](NOTICE.md)。进程边界见 [docs/architecture.md](docs/architecture.md)。
+S3 和七牛同一时刻只传一块 16 MiB，满 1000 块就换下一个对象，最后写 manifest。PostgreSQL 物理备份是 `pg_basebackup --pgdata=- --format=tar`，可选重建 `backup_manifest` 侧车以支持 PG 17+ 增量链，也可开启 `pg_receivewal` 上传 WAL 段。密码写在权限 `0600` 的客户端配置里，不放进进程参数。SSH 只做本地端口转发。从未跑过的计划会立刻视为到期。
 
 ### 归档与历史查询
 
@@ -100,7 +99,7 @@ MySQL 游标按 `WHERE` 把行流进内存中的 Parquet，再上传为一个对
 
 历史查询用进程内的 DuckDB。S3 / 七牛通过 httpfs 读取，本地存储直接读目录。条件里出现 `;`、注释或 `read_` 会被拒绝，结果默认 `LIMIT 100`。
 
-### 在线改表
+### 大表 DDL
 
 dmsx 调用 `gh-ost` 或 `pt-online-schema-change`。影子表、分批拷贝、追 binlog 和表名互换由这些工具完成。dmsx 从标准输出解析进度和预计剩余时间，经 WebSocket 推到页面。未勾选「执行到切表」时不带 `--execute`。
 
@@ -109,10 +108,13 @@ dmsx 调用 `gh-ost` 或 `pt-online-schema-change`。影子表、分批拷贝、
 从源码启动和跑测试放在这里。日常使用走上面的二进制或容器。
 
 ```bash
+cd web && npm install && npm run build && cd ..
 go run ./cmd/dmsx
 go test ./...
 go test -tags e2e ./e2e
 ```
+
+控制台在 `web/`，技术栈是 Vite + React 19 + TypeScript，支持中英文。`npm run build` 输出到 `internal/server/ui`，由 Go 嵌入。HTTP API 使用 Gin。
 
 推送和 pull request 会跑这两条。
 

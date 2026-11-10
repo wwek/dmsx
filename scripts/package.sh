@@ -44,7 +44,8 @@ cp "$src" "$root/internal/onlineddl/gh-ost"
 mkdir -p "$root/dist"
 (
 	cd "$root"
-	go build -tags ghostembed -trimpath -o "$root/dist/dmsx" ./cmd/dmsx
+	release=$(git -C "$root" describe --tags --always --dirty 2>/dev/null || echo dev)
+	go build -tags ghostembed -trimpath -ldflags "-X dmsx/internal/version.Version=${release}" -o "$root/dist/dmsx" ./cmd/dmsx
 )
 cp "$src" "$root/dist/gh-ost"
 chmod 755 "$root/dist/dmsx" "$root/dist/gh-ost"

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -91,7 +92,8 @@ func TestMySQLBackupArchiveAndColdQuery(t *testing.T) {
 	if archived["rowsArchived"].(float64) != 2 || archived["rowsDeleted"].(float64) != 2 {
 		t.Fatalf("archive counts %+v", archived)
 	}
-	if archived["objectKey"] != "dms_archives/shop/orders/2024_archive.parquet" {
+	objectKey, _ := archived["objectKey"].(string)
+	if !strings.HasPrefix(objectKey, "dms_archives/shop/orders/2024_archive_") || !strings.HasSuffix(objectKey, ".parquet") {
 		t.Fatalf("object key %v", archived["objectKey"])
 	}
 	left := mysqlCount(t)
@@ -113,6 +115,95 @@ func TestMySQLBackupArchiveAndColdQuery(t *testing.T) {
 	if rejected != http.StatusBadRequest {
 		t.Fatalf("filter status %d", rejected)
 	}
+}
+
+func TestMySQLOnlineDDL(t *testing.T) {
+	if _, err := exec.LookPath("gh-ost"); err != nil {
+		t.Skip("gh-ost is not installed")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Fatal("docker is required")
+	}
+	if err := compose("up", "-d", "--wait"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = compose("down", "-v") })
+
+	root, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := t.TempDir()
+	bin := filepath.Join(t.TempDir(), "dmsx")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/dmsx")
+	build.Dir = root
+	build.Stdout, build.Stderr = os.Stdout, os.Stderr
+	if err := build.Run(); err != nil {
+		t.Fatal(err)
+	}
+	server := exec.Command(bin)
+	server.Env = append(os.Environ(), "DMSX_ADDR=127.0.0.1:18080", "DMSX_DATA="+data)
+	server.Stdout, server.Stderr = os.Stdout, os.Stderr
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = server.Process.Kill()
+		_, _ = server.Process.Wait()
+	})
+	waitHealthy(t, "http://127.0.0.1:18080/api/health")
+	sessionCookie = ""
+	signIn(t)
+
+	database := postJSON(t, "/api/databases", map[string]any{
+		"name": "shop", "engine": "mysql", "host": "127.0.0.1", "port": 13306,
+		"username": "root", "password": "dmsx-e2e", "database": "shop", "version": "8.4",
+	})
+	postOK(t, "/api/databases/"+database["id"].(string)+"/test", nil)
+	run := postJSON(t, "/api/ddl/runs", map[string]any{
+		"databaseId": database["id"],
+		"statement":  "ALTER TABLE orders ADD COLUMN extra varchar(32)",
+		"tool":       "gh-ost",
+		"chunkSize":  1000,
+		"execute":    false,
+	})
+	finished := waitDDL(t, run["id"].(string))
+	if finished["status"] != "success" {
+		t.Fatalf("ddl %+v", finished)
+	}
+	if finished["execute"] == true {
+		t.Fatalf("dry run was stored as execute: %+v", finished)
+	}
+	if mysqlScalar(t, "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='shop' AND table_name='orders' AND column_name='extra'") != "0" {
+		t.Fatal("dry run changed the table")
+	}
+}
+
+func waitDDL(t *testing.T, id string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, row := range getArray(t, "/api/ddl/runs") {
+			if row["id"] == id && row["status"] != "running" {
+				return row
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	t.Fatal("ddl did not finish")
+	return nil
+}
+
+func mysqlScalar(t *testing.T, query string) string {
+	t.Helper()
+	cmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "-p", "dmsx-e2e", "exec", "-T", "mysql",
+		"mysql", "-uroot", "-pdmsx-e2e", "-N", "-e", query)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("mysql: %v\n%s", err, out)
+	}
+	lines := bytes.Split(bytes.TrimSpace(out), []byte("\n"))
+	return string(bytes.TrimSpace(lines[len(lines)-1]))
 }
 
 func compose(args ...string) error {

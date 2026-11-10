@@ -7,10 +7,14 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/gin-gonic/gin"
+
 	"dmsx/internal/app"
+	"dmsx/internal/version"
 )
 
 const sessionCookie = "dmsx_session"
@@ -65,95 +69,111 @@ func (s *sessions) drop(token string) {
 	s.mu.Unlock()
 }
 
-func (s *sessions) guard(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if public(r) {
-			next.ServeHTTP(w, r)
+// requireAuth rejects API calls without a live session cookie. Static console
+// files and the session endpoints stay public.
+func (s *sessions) requireAuth() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if publicPath(c.Request.Method, c.Request.URL.Path) {
+			c.Next()
 			return
 		}
-		cookie, err := r.Cookie(sessionCookie)
-		if err != nil || !s.valid(r.Context(), cookie.Value) {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "需要登录"})
+		cookie, err := c.Cookie(sessionCookie)
+		if err != nil || !s.valid(c.Request.Context(), cookie) {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "需要登录"})
 			return
 		}
-		next.ServeHTTP(w, r)
-	})
+		c.Next()
+	}
 }
 
-func public(r *http.Request) bool {
+func publicPath(method, path string) bool {
 	switch {
-	case r.Method == http.MethodGet && (r.URL.Path == "/" || r.URL.Path == "/favicon.svg" || r.URL.Path == "/app.css" || r.URL.Path == "/app.js" || r.URL.Path == "/api/health" || r.URL.Path == "/api/session"):
+	case method == http.MethodGet && (path == "/" || path == "/favicon.svg" || path == "/api/health" || path == "/api/session"):
 		return true
-	case (r.Method == http.MethodPost && (r.URL.Path == "/api/session" || r.URL.Path == "/api/setup")) || (r.Method == http.MethodDelete && r.URL.Path == "/api/session"):
+	case method == http.MethodGet && strings.HasPrefix(path, "/assets/"):
+		return true
+	case (method == http.MethodPost && (path == "/api/session" || path == "/api/setup")) || (method == http.MethodDelete && path == "/api/session"):
 		return true
 	default:
 		return false
 	}
 }
 
-func registerSession(mux *http.ServeMux, application *app.App, store *sessions) {
-	mux.HandleFunc("GET /api/session", func(w http.ResponseWriter, r *http.Request) {
-		configured, err := application.OperatorConfigured(r.Context())
+func registerSession(r gin.IRoutes, application *app.App, store *sessions) {
+	r.GET("/api/session", func(c *gin.Context) {
+		configured, err := application.OperatorConfigured(c.Request.Context())
 		if err != nil {
-			writeError(w, err)
+			writeError(c, err)
 			return
 		}
-		cookie, err := r.Cookie(sessionCookie)
-		authenticated := err == nil && store.valid(r.Context(), cookie.Value)
-		writeJSON(w, http.StatusOK, map[string]bool{"configured": configured, "authenticated": authenticated})
+		cookie, err := c.Cookie(sessionCookie)
+		authenticated := err == nil && store.valid(c.Request.Context(), cookie)
+		c.JSON(http.StatusOK, gin.H{"configured": configured, "authenticated": authenticated, "version": version.Version})
 	})
-	mux.HandleFunc("POST /api/setup", func(w http.ResponseWriter, r *http.Request) {
+	r.POST("/api/setup", func(c *gin.Context) {
 		var body struct {
 			Password string `json:"password"`
 		}
-		if !decode(w, r, &body) {
+		if !bindJSON(c, &body) {
 			return
 		}
-		if err := application.SetOperatorPassword(r.Context(), body.Password); err != nil {
-			writeError(w, err)
+		if err := application.SetOperatorPassword(c.Request.Context(), body.Password); err != nil {
+			writeError(c, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]bool{"configured": true})
+		c.JSON(http.StatusOK, gin.H{"configured": true})
 	})
-	mux.HandleFunc("POST /api/session", func(w http.ResponseWriter, r *http.Request) {
+	r.POST("/api/session", func(c *gin.Context) {
 		var body struct {
 			Password string `json:"password"`
 		}
-		if !decode(w, r, &body) {
+		if !bindJSON(c, &body) {
 			return
 		}
-		if err := application.CheckOperatorPassword(r.Context(), body.Password); err != nil {
+		if err := application.CheckOperatorPassword(c.Request.Context(), body.Password); err != nil {
 			if errors.Is(err, app.ErrPassword) {
-				application.Audit(r.Context(), "session.refused", "wrong password from "+clientAddr(r))
+				application.Audit(c.Request.Context(), "session.refused", "wrong password from "+clientAddr(c.Request))
 			}
-			writeError(w, err)
+			writeError(c, err)
 			return
 		}
-		application.Audit(r.Context(), "session.open", "signed in from "+clientAddr(r))
+		application.Audit(c.Request.Context(), "session.open", "signed in from "+clientAddr(c.Request))
 		token, err := store.issue()
 		if err != nil {
-			writeError(w, err)
+			writeError(c, err)
 			return
 		}
-		http.SetCookie(w, &http.Cookie{
-			Name:     sessionCookie,
-			Value:    token,
-			Path:     "/",
-			HttpOnly: true,
-			SameSite: http.SameSiteLaxMode,
-			MaxAge:   12 * 3600,
-		})
-		writeJSON(w, http.StatusOK, map[string]bool{"authenticated": true})
+		c.SetSameSite(http.SameSiteLaxMode)
+		c.SetCookie(sessionCookie, token, 12*3600, "/", "", false, true)
+		c.JSON(http.StatusOK, gin.H{"authenticated": true})
 	})
-	mux.HandleFunc("DELETE /api/session", func(w http.ResponseWriter, r *http.Request) {
-		if cookie, err := r.Cookie(sessionCookie); err == nil {
-			if store.valid(r.Context(), cookie.Value) {
-				application.Audit(r.Context(), "session.close", "signed out from "+clientAddr(r))
+	r.DELETE("/api/session", func(c *gin.Context) {
+		if cookie, err := c.Cookie(sessionCookie); err == nil {
+			if store.valid(c.Request.Context(), cookie) {
+				application.Audit(c.Request.Context(), "session.close", "signed out from "+clientAddr(c.Request))
 			}
-			store.drop(cookie.Value)
+			store.drop(cookie)
 		}
-		http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", HttpOnly: true, MaxAge: -1})
-		writeJSON(w, http.StatusOK, map[string]bool{"authenticated": false})
+		c.SetCookie(sessionCookie, "", -1, "/", "", false, true)
+		c.JSON(http.StatusOK, gin.H{"authenticated": false})
+	})
+	r.PUT("/api/session/password", func(c *gin.Context) {
+		var body struct {
+			Current string `json:"current"`
+			Password string `json:"password"`
+		}
+		if !bindJSON(c, &body) {
+			return
+		}
+		if err := application.ChangeOperatorPassword(c.Request.Context(), body.Current, body.Password); err != nil {
+			writeError(c, err)
+			return
+		}
+		if cookie, err := c.Cookie(sessionCookie); err == nil {
+			store.drop(cookie)
+		}
+		c.SetCookie(sessionCookie, "", -1, "/", "", false, true)
+		c.JSON(http.StatusOK, gin.H{"ok": true})
 	})
 }
 

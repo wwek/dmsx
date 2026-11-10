@@ -28,6 +28,9 @@ func TestResetPasswordEndsOpenSessions(t *testing.T) {
 		handler.ServeHTTP(rec, req)
 		return rec
 	}
+	if rec := call(http.MethodGet, "/api/session", "", nil); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"version":"dev"`) {
+		t.Fatalf("session version %d %s", rec.Code, rec.Body)
+	}
 	if rec := call(http.MethodPost, "/api/setup", `{"password":"first-password"}`, nil); rec.Code != http.StatusOK {
 		t.Fatalf("setup %d %s", rec.Code, rec.Body)
 	}

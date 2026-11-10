@@ -46,7 +46,7 @@ func (a *App) CreateNotifier(ctx context.Context, in Notifier) (Notifier, error)
 	if in.DatabaseIDs == nil {
 		in.DatabaseIDs = []string{}
 	}
-	if err := a.cat.Put(ctx, kindNotifier, in.ID, in); err != nil {
+	if err := a.repo.Put(ctx, kindNotifier, in.ID, in); err != nil {
 		return Notifier{}, err
 	}
 	a.Audit(ctx, "notifier.create", in.Name+" ("+in.Type+")")
@@ -55,7 +55,7 @@ func (a *App) CreateNotifier(ctx context.Context, in Notifier) (Notifier, error)
 
 func (a *App) ListNotifiers(ctx context.Context) ([]Notifier, error) {
 	var rows []Notifier
-	if err := a.cat.List(ctx, kindNotifier, &rows); err != nil {
+	if err := a.repo.List(ctx, kindNotifier, &rows); err != nil {
 		return nil, err
 	}
 	out := make([]Notifier, 0, len(rows))
@@ -71,20 +71,131 @@ func (a *App) ListNotifiers(ctx context.Context) ([]Notifier, error) {
 
 func (a *App) DeleteNotifier(ctx context.Context, id string) error {
 	var row Notifier
-	if err := a.cat.Get(ctx, kindNotifier, id, &row); err != nil {
+	if err := a.repo.Get(ctx, kindNotifier, id, &row); err != nil {
 		return err
 	}
-	if err := a.cat.Delete(ctx, kindNotifier, id); err != nil {
+	if err := a.repo.Delete(ctx, kindNotifier, id); err != nil {
 		return err
 	}
 	a.Audit(ctx, "notifier.delete", row.Name)
 	return nil
 }
 
+// UpdateNotifier replaces name, events and database filters. Empty secret
+// settings keep the sealed values already stored.
+func (a *App) UpdateNotifier(ctx context.Context, id string, in Notifier) (Notifier, error) {
+	var existing Notifier
+	if err := a.repo.Get(ctx, kindNotifier, id, &existing); err != nil {
+		return Notifier{}, err
+	}
+	in.Type = strings.ToUpper(in.Type)
+	if in.Type == "" {
+		in.Type = existing.Type
+	}
+	if in.Type != existing.Type {
+		return Notifier{}, fmt.Errorf("notifier type cannot change")
+	}
+	if in.Name == "" {
+		return Notifier{}, fmt.Errorf("name is required")
+	}
+	if len(in.Events) == 0 {
+		return Notifier{}, fmt.Errorf("choose at least one event")
+	}
+	for _, event := range in.Events {
+		if !notify.ValidEvent(event) {
+			return Notifier{}, fmt.Errorf("unknown event %q", event)
+		}
+	}
+	for _, databaseID := range in.DatabaseIDs {
+		if _, err := a.database(ctx, databaseID); err != nil {
+			return Notifier{}, err
+		}
+	}
+	opened, err := a.openSettings(existing.Settings, notify.SecretFields)
+	if err != nil {
+		return Notifier{}, err
+	}
+	merged, err := mergeSettings(opened, in.Settings, notify.SecretFields)
+	if err != nil {
+		return Notifier{}, err
+	}
+	if _, err := notify.New(in.Type, merged); err != nil {
+		return Notifier{}, err
+	}
+	sealed, err := a.sealSettings(merged, notify.SecretFields)
+	if err != nil {
+		return Notifier{}, err
+	}
+	in.ID = existing.ID
+	in.Settings = sealed
+	in.CreatedAt = existing.CreatedAt
+	in.LastSentAt = existing.LastSentAt
+	in.LastError = existing.LastError
+	if in.DatabaseIDs == nil {
+		in.DatabaseIDs = []string{}
+	}
+	if err := a.repo.Put(ctx, kindNotifier, in.ID, in); err != nil {
+		return Notifier{}, err
+	}
+	a.Audit(ctx, "notifier.update", in.Name+" ("+in.Type+")")
+	return a.publicNotifier(in)
+}
+
+// ProbeNotifier sends a test message from the form before it is saved.
+// When id is set, a blank secret keeps the value already stored.
+func (a *App) ProbeNotifier(ctx context.Context, in Notifier) error {
+	settings := in.Settings
+	kind := strings.ToUpper(in.Type)
+	if in.ID != "" {
+		var existing Notifier
+		if err := a.repo.Get(ctx, kindNotifier, in.ID, &existing); err != nil {
+			return err
+		}
+		if kind == "" {
+			kind = existing.Type
+		}
+		opened, err := a.openSettings(existing.Settings, notify.SecretFields)
+		if err != nil {
+			return err
+		}
+		settings, err = mergeSettings(opened, in.Settings, notify.SecretFields)
+		if err != nil {
+			return err
+		}
+	}
+	sender, err := notify.New(kind, settings)
+	if err == nil {
+		ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+		name := in.Name
+		if name == "" {
+			name = kind
+		}
+		err = sender.Send(ctx, notify.Message{
+			Event:   notify.EventTest,
+			Heading: "dmsx 测试通知",
+			Text:    "这条消息说明 “" + name + "” 可以收到 dmsx 的通知。",
+		})
+	}
+	if in.ID != "" {
+		now := time.Now().UTC()
+		var current Notifier
+		if a.repo.Get(context.WithoutCancel(ctx), kindNotifier, in.ID, &current) == nil {
+			current.LastSentAt = &now
+			current.LastError = ""
+			if err != nil {
+				current.LastError = err.Error()
+			}
+			_ = a.repo.Put(context.WithoutCancel(ctx), kindNotifier, current.ID, current)
+		}
+	}
+	return err
+}
+
 // TestNotifier sends a test message now and returns the delivery error.
 func (a *App) TestNotifier(ctx context.Context, id string) error {
 	var row Notifier
-	if err := a.cat.Get(ctx, kindNotifier, id, &row); err != nil {
+	if err := a.repo.Get(ctx, kindNotifier, id, &row); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
@@ -112,7 +223,7 @@ func (a *App) notify(databaseID string, msg notify.Message) {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
 		var rows []Notifier
-		if err := a.cat.List(ctx, kindNotifier, &rows); err != nil {
+		if err := a.repo.List(ctx, kindNotifier, &rows); err != nil {
 			log.Printf("notify: %v", err)
 			return
 		}
@@ -141,20 +252,20 @@ func (a *App) deliver(ctx context.Context, row Notifier, msg notify.Message) err
 	}
 	now := time.Now().UTC()
 	var current Notifier
-	if a.cat.Get(context.WithoutCancel(ctx), kindNotifier, row.ID, &current) == nil {
+	if a.repo.Get(context.WithoutCancel(ctx), kindNotifier, row.ID, &current) == nil {
 		current.LastSentAt = &now
 		current.LastError = ""
 		if err != nil {
 			current.LastError = err.Error()
 		}
-		_ = a.cat.Put(context.WithoutCancel(ctx), kindNotifier, current.ID, current)
+		_ = a.repo.Put(context.WithoutCancel(ctx), kindNotifier, current.ID, current)
 	}
 	return err
 }
 
 func (a *App) databaseName(ctx context.Context, id string) string {
 	var row Database
-	if err := a.cat.Get(ctx, kindDatabase, id, &row); err != nil {
+	if err := a.repo.Get(ctx, kindDatabase, id, &row); err != nil {
 		return id
 	}
 	return row.Name

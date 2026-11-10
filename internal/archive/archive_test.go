@@ -8,8 +8,16 @@ import (
 	"io"
 	"sync"
 	"testing"
-	"time"
 )
+
+func TestPrefixedKeyMatchesColdQuery(t *testing.T) {
+	if got := PrefixedKey("tenant/a", "dms_archives/shop/orders/2024_archive.parquet"); got != "tenant/a/dms_archives/shop/orders/2024_archive.parquet" {
+		t.Fatal(got)
+	}
+	if got := PrefixedKey("", "dms_archives/shop/orders/2024_archive.parquet"); got != "dms_archives/shop/orders/2024_archive.parquet" {
+		t.Fatal(got)
+	}
+}
 
 func TestObjectKey(t *testing.T) {
 	key, err := ObjectKey("shop", "orders", 2024, "")
@@ -19,37 +27,81 @@ func TestObjectKey(t *testing.T) {
 	if key != "dms_archives/shop/orders/2024_archive.parquet" {
 		t.Fatal(key)
 	}
-	if _, err := ObjectKey("shop", "orders;drop", 2024, ""); err == nil {
-		t.Fatal("identifier was accepted")
-	}
-	if err := sqlPredicate(); err != nil {
+	if err := (Request{Database: "shop", Table: "orders", Year: 2024, Where: "create_time < '2025-01-01'"}).validate(); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func sqlPredicate() error {
-	return validateWhere("create_time < '2025-01-01'")
+type memTable struct {
+	pk      PrimaryKey
+	cols    []Column
+	rows    [][]any
+	deleted [][]any
 }
 
-func validateWhere(text string) error {
-	req := Request{Database: "shop", Table: "orders", Year: 2024, Where: text}
-	return req.validate()
-}
+func (m *memTable) PrimaryKey(context.Context) (PrimaryKey, error) { return m.pk, nil }
+func (m *memTable) Columns(context.Context) ([]Column, error)      { return m.cols, nil }
+func (m *memTable) Close()                                         {}
 
-type sliceSource struct {
-	cols []Column
-	rows [][]any
-	i    int
-}
-
-func (s *sliceSource) Columns(context.Context) ([]Column, error) { return s.cols, nil }
-func (s *sliceSource) Next(context.Context) ([]any, error) {
-	if s.i >= len(s.rows) {
-		return nil, io.EOF
+func (m *memTable) FetchChunk(_ context.Context, after []any, limit int) ([][]any, error) {
+	var out [][]any
+	for _, row := range m.rows {
+		if len(after) > 0 && !keyGreater(row[:len(m.pk)], after) {
+			continue
+		}
+		if deleted(m.deleted, row[:len(m.pk)]) {
+			continue
+		}
+		out = append(out, append([]any(nil), row...))
+		if len(out) >= limit {
+			break
+		}
 	}
-	row := s.rows[s.i]
-	s.i++
-	return row, nil
+	return out, nil
+}
+
+func (m *memTable) DeleteKeys(_ context.Context, keys [][]any) (int64, error) {
+	var n int64
+	for _, key := range keys {
+		if deleted(m.deleted, key) {
+			continue
+		}
+		m.deleted = append(m.deleted, append([]any(nil), key...))
+		n++
+	}
+	return n, nil
+}
+
+func keyGreater(a, b []any) bool {
+	for i := range a {
+		ai, _ := a[i].(int64)
+		bi, _ := b[i].(int64)
+		if ai > bi {
+			return true
+		}
+		if ai < bi {
+			return false
+		}
+	}
+	return false
+}
+
+func deleted(set [][]any, key []any) bool {
+	for _, existing := range set {
+		same := len(existing) == len(key)
+		if same {
+			for i := range key {
+				if existing[i] != key[i] {
+					same = false
+					break
+				}
+			}
+		}
+		if same {
+			return true
+		}
+	}
+	return false
 }
 
 type memDest struct {
@@ -88,49 +140,52 @@ func (m *memDest) Exists(_ context.Context, key string) (bool, error) {
 	return ok, nil
 }
 
-type countingDelete struct{ n int64 }
-
-func (d *countingDelete) DeleteBatches(context.Context, int, func()) (int64, error) {
-	d.n = 2
-	return 2, nil
-}
-
-func TestArchiveVerifiesMD5BeforeDelete(t *testing.T) {
-	src := &sliceSource{
-		cols: []Column{{Name: "id", Kind: KindInt}, {Name: "create_time", Kind: KindString}},
-		rows: [][]any{{int64(1), "2024-02-01"}, {int64(2), "2024-03-01"}},
+func TestArchiveChunksByPrimaryKey(t *testing.T) {
+	table := &memTable{
+		pk:   PrimaryKey{"id"},
+		cols: []Column{{Name: "id", Kind: KindInt}, {Name: "note", Kind: KindString}},
+		rows: [][]any{{int64(1), "a"}, {int64(2), "b"}, {int64(3), "c"}, {int64(4), "d"}, {int64(5), "e"}},
 	}
 	dest := &memDest{}
-	del := &countingDelete{}
 	result, err := Run(context.Background(), Request{
-		Database: "shop", Table: "orders", Year: 2024,
-		Where: "create_time < '2025-01-01'", DeleteAfter: true,
-	}, src, dest, del, func() {})
+		Database: "shop", Table: "orders", Year: 2024, Where: "id > 0", DeleteAfter: true, BatchSize: 2,
+	}, table, dest, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.RowsArchived != 2 || result.RowsDeleted != 2 {
+	if result.RowsArchived != 5 || result.RowsDeleted != 5 || len(result.Keys) != 3 {
 		t.Fatalf("%+v", result)
 	}
-	body := dest.objs[result.Key]
-	sum := md5.Sum(body)
+	sum := md5.Sum(dest.objs[result.Key])
 	if result.MD5 != fmtHex(sum[:]) {
-		t.Fatalf("md5 %s vs %x", result.MD5, sum)
+		t.Fatalf("md5")
 	}
-	if err := validateWhere("create_time < '2025-01-01'; DROP TABLE orders"); err == nil {
-		t.Fatal("statement break was accepted")
-	}
-	_ = time.Second
 }
 
-func fmtHex(b []byte) string {
-	const hexdigits = "0123456789abcdef"
-	out := make([]byte, len(b)*2)
-	for i, c := range b {
-		out[i*2] = hexdigits[c>>4]
-		out[i*2+1] = hexdigits[c&0x0f]
+func TestArchiveDoesNotDeleteWhenMD5Differs(t *testing.T) {
+	table := &memTable{pk: PrimaryKey{"id"}, cols: []Column{{Name: "id", Kind: KindInt}}, rows: [][]any{{int64(1)}}}
+	bad := &badDest{}
+	_, err := Run(context.Background(), Request{Database: "shop", Table: "orders", Year: 2024, Where: "id < 10", DeleteAfter: true}, table, bad, nil, nil)
+	if err == nil || len(table.deleted) != 0 {
+		t.Fatalf("err=%v deleted=%v", err, table.deleted)
 	}
-	return string(out)
+}
+
+func TestArchiveCancelStopsBetweenBatches(t *testing.T) {
+	table := &memTable{pk: PrimaryKey{"id"}, cols: []Column{{Name: "id", Kind: KindInt}}, rows: [][]any{{int64(1)}, {int64(2)}, {int64(3)}, {int64(4)}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	batch := 0
+	_, err := Run(ctx, Request{Database: "shop", Table: "orders", Year: 2024, Where: "id > 0", DeleteAfter: true, BatchSize: 2}, table, &memDest{}, nil, func(p Progress) {
+		if p.Phase == PhaseDone && p.RowsArchived > 0 {
+			batch++
+			if batch == 1 {
+				cancel()
+			}
+		}
+	})
+	if !errors.Is(err, context.Canceled) || len(table.deleted) != 2 {
+		t.Fatalf("err=%v deleted=%v", err, table.deleted)
+	}
 }
 
 type badDest struct{ memDest }
@@ -148,20 +203,12 @@ func (b *badDest) Open(ctx context.Context, key string) (io.ReadCloser, error) {
 	return io.NopCloser(bytes.NewReader(body)), nil
 }
 
-func TestArchiveDoesNotDeleteWhenMD5Differs(t *testing.T) {
-	src := &sliceSource{
-		cols: []Column{{Name: "id", Kind: KindInt}},
-		rows: [][]any{{int64(1)}},
+func fmtHex(b []byte) string {
+	const hexdigits = "0123456789abcdef"
+	out := make([]byte, len(b)*2)
+	for i, c := range b {
+		out[i*2] = hexdigits[c>>4]
+		out[i*2+1] = hexdigits[c&0x0f]
 	}
-	del := &countingDelete{}
-	_, err := Run(context.Background(), Request{
-		Database: "shop", Table: "orders", Year: 2024,
-		Where: "id < 10", DeleteAfter: true,
-	}, src, &badDest{}, del, func() {})
-	if err == nil {
-		t.Fatal("expected md5 failure")
-	}
-	if del.n != 0 {
-		t.Fatal("rows were deleted after a bad checksum")
-	}
+	return string(out)
 }

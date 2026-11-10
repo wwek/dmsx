@@ -30,6 +30,8 @@ type Request struct {
 	SecretKey string
 	PathStyle bool
 	UseSSL    bool
+	SkipTLS   bool
+	Prefix    string
 }
 
 type Row map[string]any
@@ -102,7 +104,7 @@ func sourceGlob(req Request) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return "s3://" + req.Bucket + "/" + suffix, nil
+	return "s3://" + req.Bucket + "/" + archive.PrefixedKey(req.Prefix, suffix), nil
 }
 
 func configureS3(ctx context.Context, db *sql.DB, req Request) error {
@@ -112,6 +114,15 @@ func configureS3(ctx context.Context, db *sql.DB, req Request) error {
 	if _, err := db.ExecContext(ctx, "LOAD httpfs"); err != nil {
 		return fmt.Errorf("duckdb httpfs load: %w", err)
 	}
+	for _, statement := range s3Statements(req) {
+		if _, err := db.ExecContext(ctx, statement); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func s3Statements(req Request) []string {
 	endpoint := strings.TrimPrefix(strings.TrimPrefix(req.Endpoint, "https://"), "http://")
 	endpoint = strings.TrimRight(endpoint, "/")
 	region := req.Region
@@ -123,7 +134,7 @@ func configureS3(ctx context.Context, db *sql.DB, req Request) error {
 		style = "path"
 	}
 	ssl := "true"
-	if !req.UseSSL && strings.HasPrefix(req.Endpoint, "http://") {
+	if !req.UseSSL {
 		ssl = "false"
 	}
 	settings := []string{
@@ -134,12 +145,10 @@ func configureS3(ctx context.Context, db *sql.DB, req Request) error {
 		"SET s3_url_style=" + sqlString(style),
 		"SET s3_use_ssl=" + ssl,
 	}
-	for _, statement := range settings {
-		if _, err := db.ExecContext(ctx, statement); err != nil {
-			return err
-		}
+	if req.SkipTLS {
+		settings = append(settings, "SET enable_server_cert_verification=false")
 	}
-	return nil
+	return settings
 }
 
 func sqlString(value string) string {

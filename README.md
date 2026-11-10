@@ -76,6 +76,7 @@ The image includes the usual database client tools. The page is published only o
 | Jobs | Scheduled backup, retention, restore, single-table archive, history lookup, online schema change |
 | Page | `127.0.0.1:8080` by default, override with `DMSX_ADDR` |
 | Data directory | `DMSX_DATA`. The binary defaults to `./data`. The container uses `/var/lib/dmsx` |
+| Metadata repo | SQLite file in the data directory (connections, plans, runs). Backup bytes are not stored there |
 | Sign-in | One operator password. The hash lives in the data-directory database, and the session is a browser cookie. The password is not stored in a config file or an environment variable |
 
 A binary install needs `mysqldump`, `mariadb-dump`, `pg_dump`, `pg_basebackup` and `mongodump` on the machine. `scripts/package.sh` downloads the official [gh-ost](https://github.com/github/gh-ost) release, checks its checksum, embeds it in `dist/dmsx`, and also writes `dist/gh-ost`. `pt-online-schema-change` is still installed separately. Point at a specific binary with variables such as `DMSX_MYSQLDUMP` and `DMSX_GH_OST`.
@@ -86,9 +87,7 @@ A binary install needs `mysqldump`, `mariadb-dump`, `pg_dump`, `pg_basebackup` a
 
 Dump-tool stdout follows one pipe: `mysqldump` / `mariadb-dump` / `pg_dump` / `pg_basebackup` / `mongodump` → zstd for plain SQL → optional AES-GCM → storage. Encrypted files start with the header `DMSXBK01`.
 
-S3 and Qiniu keep a single 16 MiB part in flight, roll to the next object at 1000 parts, and write the manifest last. PostgreSQL physical backup is `pg_basebackup --pgdata=- --format=tar`. Passwords go into a mode `0600` client file, not onto the process arguments. SSH is a local port forward. A plan that has never run is due immediately.
-
-This path follows the design published by [Databasus](https://github.com/databasus/databasus). dmsx reimplements it and does not copy that source tree. The files are not interchangeable with Databasus backups. See [NOTICE.md](NOTICE.md). Process boundaries are in [docs/architecture.md](docs/architecture.md).
+S3 and Qiniu keep a single 16 MiB part in flight, roll to the next object at 1000 parts, and write the manifest last. PostgreSQL physical backup is `pg_basebackup --pgdata=- --format=tar`, with an optional reconstructed `backup_manifest` sidecar for PG 17+ incremental chains and optional `pg_receivewal` segment upload. Passwords go into a mode `0600` client file, not onto the process arguments. SSH is a local port forward. A plan that has never run is due immediately.
 
 ### Archive and history lookup
 
@@ -109,10 +108,13 @@ dmsx runs `gh-ost` or `pt-online-schema-change`. The tool owns the ghost table, 
 Running from source and running tests belong here. Day-to-day use is the binary or the container above.
 
 ```bash
+cd web && npm install && npm run build && cd ..
 go run ./cmd/dmsx
 go test ./...
 go test -tags e2e ./e2e
 ```
+
+The console lives in `web/` (Vite + React 19 + TypeScript, zh/en). `npm run build` writes into `internal/server/ui`, which the Go binary embeds. The HTTP API uses Gin.
 
 GitHub Actions runs both on push and pull request.
 

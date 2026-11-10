@@ -25,12 +25,22 @@ const (
 	EventHealthUp       Event = "HEALTH_AVAILABLE"
 	EventRestoreSuccess Event = "RESTORE_SUCCESS"
 	EventRestoreFailed  Event = "RESTORE_FAILED"
+	EventArchiveSuccess Event = "ARCHIVE_SUCCESS"
+	EventArchiveFailed  Event = "ARCHIVE_FAILED"
+	EventDDLSuccess     Event = "DDL_SUCCESS"
+	EventDDLFailed      Event = "DDL_FAILED"
 	EventTest           Event = "TEST"
 )
 
 // Events lists every event a channel can subscribe to. EventTest is not one of
 // them; a test message is always delivered.
-var Events = []Event{EventBackupSuccess, EventBackupFailed, EventHealthDown, EventHealthUp, EventRestoreSuccess, EventRestoreFailed}
+var Events = []Event{
+	EventBackupSuccess, EventBackupFailed,
+	EventHealthDown, EventHealthUp,
+	EventRestoreSuccess, EventRestoreFailed,
+	EventArchiveSuccess, EventArchiveFailed,
+	EventDDLSuccess, EventDDLFailed,
+}
 
 func ValidEvent(name string) bool {
 	for _, event := range Events {
@@ -64,7 +74,7 @@ const (
 	TypeWebhook    = "WEBHOOK"
 )
 
-// SecretFields are the settings keys that are sealed in the catalog and blanked
+// SecretFields are the settings keys that are sealed in the metadata repo and blanked
 // in API responses. A chat webhook URL authorizes the post by itself.
 var SecretFields = []string{"password", "botToken", "webhookUrl", "proxyUrl", "headers"}
 

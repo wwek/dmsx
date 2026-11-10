@@ -28,7 +28,7 @@ func TestNotifierSecretsAreSealedAndMasked(t *testing.T) {
 		t.Fatalf("response settings %s", created.Settings)
 	}
 	var stored Notifier
-	if err := application.cat.Get(ctx, kindNotifier, created.ID, &stored); err != nil {
+	if err := application.repo.Get(ctx, kindNotifier, created.ID, &stored); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(stored.Settings), "123:secret") {
@@ -40,6 +40,44 @@ func TestNotifierSecretsAreSealedAndMasked(t *testing.T) {
 	}
 	if _, err := application.CreateNotifier(ctx, Notifier{Name: "x", Type: "telegram", Settings: raw, Events: []string{"NOPE"}}); err == nil {
 		t.Fatal("unknown event accepted")
+	}
+}
+
+func TestUpdateNotifierKeepsBotToken(t *testing.T) {
+	application := openApp(t)
+	ctx := context.Background()
+	raw := json.RawMessage(`{"botToken":"123:secret","chatId":"42"}`)
+	created, err := application.CreateNotifier(ctx, Notifier{Name: "ops", Type: "telegram", Settings: raw, Events: []string{"BACKUP_FAILED"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	next := json.RawMessage(`{"botToken":"","chatId":"99","apiUrl":"https://api.telegram.org"}`)
+	updated, err := application.UpdateNotifier(ctx, created.ID, Notifier{
+		Name: "ops-2", Type: "telegram", Settings: next, Events: []string{"BACKUP_FAILED", "BACKUP_SUCCESS"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Name != "ops-2" || strings.Contains(string(updated.Settings), "secret") {
+		t.Fatalf("%+v", updated)
+	}
+	var stored Notifier
+	if err := application.repo.Get(ctx, kindNotifier, created.ID, &stored); err != nil {
+		t.Fatal(err)
+	}
+	opened, err := application.openSettings(stored.Settings, notify.SecretFields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings map[string]string
+	if err := json.Unmarshal(opened, &settings); err != nil {
+		t.Fatal(err)
+	}
+	if settings["botToken"] != "123:secret" || settings["chatId"] != "99" {
+		t.Fatalf("%+v", settings)
+	}
+	if len(stored.Events) != 2 {
+		t.Fatalf("events %+v", stored.Events)
 	}
 }
 
@@ -99,7 +137,7 @@ func TestTotalSizeCapDeletesOldestBackups(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(directory, run.FileName), []byte("x"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		if err := application.cat.Put(ctx, kindRun, run.ID, run); err != nil {
+		if err := application.repo.Put(ctx, kindRun, run.ID, run); err != nil {
 			t.Fatal(err)
 		}
 	}

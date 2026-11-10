@@ -2,6 +2,7 @@ package archive
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -22,7 +23,18 @@ import (
 type S3Uploader struct {
 	Client   *s3.Client
 	Bucket   string
+	prefix   string
 	uploader *manager.Uploader
+}
+
+// PrefixedKey applies the storage prefix so upload, MD5 reread and cold query name the same object.
+func PrefixedKey(prefix, key string) string {
+	prefix = strings.Trim(prefix, "/")
+	key = strings.TrimLeft(key, "/")
+	if prefix == "" {
+		return key
+	}
+	return prefix + "/" + key
 }
 
 func NewS3Uploader(settings storage.S3Settings) (*S3Uploader, error) {
@@ -38,6 +50,9 @@ func NewS3Uploader(settings storage.S3Settings) (*S3Uploader, error) {
 		Region:      region,
 		Credentials: credentials.NewStaticCredentialsProvider(settings.AccessKey, settings.SecretKey, ""),
 	}
+	if settings.SkipTLS {
+		cfg.HTTPClient = &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}
+	}
 	client := s3.NewFromConfig(cfg, func(opts *s3.Options) {
 		if endpoint != "" {
 			opts.BaseEndpoint = aws.String(endpoint)
@@ -48,20 +63,20 @@ func NewS3Uploader(settings storage.S3Settings) (*S3Uploader, error) {
 		u.PartSize = 8 << 20
 		u.Concurrency = 1
 	})
-	return &S3Uploader{Client: client, Bucket: settings.Bucket, uploader: uploader}, nil
+	return &S3Uploader{Client: client, Bucket: settings.Bucket, prefix: settings.Prefix, uploader: uploader}, nil
 }
 
 func (u *S3Uploader) Upload(ctx context.Context, key string, body io.Reader) error {
 	_, err := u.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(u.Bucket),
-		Key:    aws.String(key),
+		Key:    aws.String(PrefixedKey(u.prefix, key)),
 		Body:   body,
 	})
 	return err
 }
 
 func (u *S3Uploader) Open(ctx context.Context, key string) (io.ReadCloser, error) {
-	out, err := u.Client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(u.Bucket), Key: aws.String(key)})
+	out, err := u.Client.GetObject(ctx, &s3.GetObjectInput{Bucket: aws.String(u.Bucket), Key: aws.String(PrefixedKey(u.prefix, key))})
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +84,7 @@ func (u *S3Uploader) Open(ctx context.Context, key string) (io.ReadCloser, error
 }
 
 func (u *S3Uploader) Exists(ctx context.Context, key string) (bool, error) {
-	_, err := u.Client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(u.Bucket), Key: aws.String(key)})
+	_, err := u.Client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: aws.String(u.Bucket), Key: aws.String(PrefixedKey(u.prefix, key))})
 	if err == nil {
 		return true, nil
 	}

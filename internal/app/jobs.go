@@ -23,42 +23,15 @@ import (
 )
 
 func (a *App) CreateConfig(ctx context.Context, in BackupConfig) (BackupConfig, error) {
-	if _, err := a.database(ctx, in.DatabaseID); err != nil {
+	if err := a.validateConfig(ctx, &in); err != nil {
 		return BackupConfig{}, err
-	}
-	if _, _, err := a.store(ctx, in.StorageID); err != nil {
-		return BackupConfig{}, err
-	}
-	if in.Method == "" {
-		in.Method = "logical"
-	}
-	if in.Method != "logical" && in.Method != "physical" {
-		return BackupConfig{}, fmt.Errorf("method must be logical or physical")
-	}
-	if err := in.Schedule.Validate(); err != nil {
-		return BackupConfig{}, err
-	}
-	if err := in.Retention.Validate(); err != nil {
-		return BackupConfig{}, err
-	}
-	for _, name := range append(append([]string{}, in.ExcludeTables...), in.ExcludeData...) {
-		if !sqlident.Valid(name) {
-			return BackupConfig{}, fmt.Errorf("invalid table name %q", name)
-		}
-	}
-	if in.Name == "" {
-		return BackupConfig{}, fmt.Errorf("name is required")
-	}
-	if in.MaxBackupSizeMB < 0 || in.MaxTotalSizeMB < 0 {
-		return BackupConfig{}, fmt.Errorf("size limits cannot be negative")
-	}
-	if in.MaxFailedTries == 0 {
-		in.MaxFailedTries = 3
 	}
 	in.ID = uuid.NewString()
 	in.CreatedAt = time.Now().UTC()
 	in.Enabled = true
-	if err := a.cat.Put(ctx, kindConfig, in.ID, in); err != nil {
+	in.FailCount = 0
+	in.LastRunAt = nil
+	if err := a.repo.Put(ctx, kindConfig, in.ID, in); err != nil {
 		return BackupConfig{}, err
 	}
 	a.Audit(ctx, "backup_plan.create", in.Name+" for "+a.databaseName(ctx, in.DatabaseID))
@@ -67,7 +40,7 @@ func (a *App) CreateConfig(ctx context.Context, in BackupConfig) (BackupConfig, 
 
 func (a *App) ListConfigs(ctx context.Context) ([]BackupConfig, error) {
 	var rows []BackupConfig
-	if err := a.cat.List(ctx, kindConfig, &rows); err != nil {
+	if err := a.repo.List(ctx, kindConfig, &rows); err != nil {
 		return nil, err
 	}
 	if rows == nil {
@@ -78,10 +51,10 @@ func (a *App) ListConfigs(ctx context.Context) ([]BackupConfig, error) {
 
 func (a *App) DeleteConfig(ctx context.Context, id string) error {
 	var cfg BackupConfig
-	if err := a.cat.Get(ctx, kindConfig, id, &cfg); err != nil {
+	if err := a.repo.Get(ctx, kindConfig, id, &cfg); err != nil {
 		return err
 	}
-	if err := a.cat.Delete(ctx, kindConfig, id); err != nil {
+	if err := a.repo.Delete(ctx, kindConfig, id); err != nil {
 		return err
 	}
 	a.Audit(ctx, "backup_plan.delete", cfg.Name)
@@ -90,7 +63,7 @@ func (a *App) DeleteConfig(ctx context.Context, id string) error {
 
 func (a *App) ListRuns(ctx context.Context) ([]BackupRun, error) {
 	var rows []BackupRun
-	if err := a.cat.List(ctx, kindRun, &rows); err != nil {
+	if err := a.repo.List(ctx, kindRun, &rows); err != nil {
 		return nil, err
 	}
 	if rows == nil {
@@ -99,20 +72,25 @@ func (a *App) ListRuns(ctx context.Context) ([]BackupRun, error) {
 	return rows, nil
 }
 
-// StartBackup is the operator's "back up now".
-func (a *App) StartBackup(ctx context.Context, configID string) (BackupRun, error) {
-	run, err := a.startBackup(ctx, configID)
+// StartBackup is the operator's "back up now". forceFull starts a new physical
+// full even when the plan is full_incr.
+func (a *App) StartBackup(ctx context.Context, configID string, forceFull bool) (BackupRun, error) {
+	run, err := a.startBackup(ctx, configID, forceFull)
 	if err == nil {
 		var cfg BackupConfig
-		_ = a.cat.Get(ctx, kindConfig, configID, &cfg)
-		a.Audit(ctx, "backup.run", cfg.Name+" for "+a.databaseName(ctx, run.DatabaseID))
+		_ = a.repo.Get(ctx, kindConfig, configID, &cfg)
+		detail := cfg.Name + " for " + a.databaseName(ctx, run.DatabaseID)
+		if forceFull {
+			detail += " (force full)"
+		}
+		a.Audit(ctx, "backup.run", detail)
 	}
 	return run, err
 }
 
-func (a *App) startBackup(ctx context.Context, configID string) (BackupRun, error) {
+func (a *App) startBackup(ctx context.Context, configID string, forceFull bool) (BackupRun, error) {
 	var cfg BackupConfig
-	if err := a.cat.Get(ctx, kindConfig, configID, &cfg); err != nil {
+	if err := a.repo.Get(ctx, kindConfig, configID, &cfg); err != nil {
 		return BackupRun{}, err
 	}
 	run := BackupRun{
@@ -122,9 +100,10 @@ func (a *App) startBackup(ctx context.Context, configID string) (BackupRun, erro
 		StorageID:  cfg.StorageID,
 		Status:     "running",
 		Encrypted:  cfg.Encrypted,
+		ForceFull:  forceFull && cfg.Method == "physical",
 		StartedAt:  time.Now().UTC(),
 	}
-	if err := a.cat.Put(ctx, kindRun, run.ID, run); err != nil {
+	if err := a.repo.Put(ctx, kindRun, run.ID, run); err != nil {
 		return BackupRun{}, err
 	}
 	jobCtx, cancel := context.WithCancel(a.root)
@@ -157,14 +136,17 @@ func (a *App) executeBackup(ctx context.Context, cfg BackupConfig, run BackupRun
 		run.Error = ""
 		cfg.FailCount = 0
 		a.applyRetention(ctx, cfg)
+		if cfg.Method == "physical" && cfg.WalEnabled {
+			a.ensureWalStreamer(cfg)
+		}
 	}
 	cfg.LastRunAt = &now
 	var still BackupRun
-	if err := a.cat.Get(context.WithoutCancel(ctx), kindRun, run.ID, &still); err != nil {
+	if err := a.repo.Get(context.WithoutCancel(ctx), kindRun, run.ID, &still); err != nil {
 		return
 	}
-	_ = a.cat.Put(context.WithoutCancel(ctx), kindRun, run.ID, run)
-	_ = a.cat.Put(context.WithoutCancel(ctx), kindConfig, cfg.ID, cfg)
+	_ = a.repo.Put(context.WithoutCancel(ctx), kindRun, run.ID, run)
+	_ = a.repo.Put(context.WithoutCancel(ctx), kindConfig, cfg.ID, cfg)
 	if !cancelled {
 		a.notifyBackup(context.WithoutCancel(ctx), cfg, run)
 	}
@@ -212,6 +194,14 @@ func (a *App) backupOnce(ctx context.Context, cfg *BackupConfig, run *BackupRun)
 	src.ExcludeTables = cfg.ExcludeTables
 	src.IncludeSchemas = cfg.IncludeSchemas
 	src.ExcludeTableData = cfg.ExcludeData
+	if cfg.Method == "physical" {
+		cleanup, prepErr := a.preparePhysical(ctx, cfg, run, &src)
+		defer cleanup()
+		if prepErr != nil {
+			return prepErr
+		}
+		_ = a.repo.Put(context.WithoutCancel(ctx), kindRun, run.ID, run)
+	}
 	fileID, err := uuid.Parse(run.ID)
 	if err != nil {
 		return err
@@ -223,7 +213,7 @@ func (a *App) backupOnce(ctx context.Context, cfg *BackupConfig, run *BackupRun)
 	run.FileName = fmt.Sprintf("backups/%s/%s_%s%s", db.ID, run.StartedAt.UTC().Format("20060102T150405Z"), run.ID, ext)
 	result, err := backup.Run(ctx, src, cfg.Encrypted, a.master, fileID, store, run.FileName, cfg.MaxBackupSizeMB<<20, func(n int64) {
 		run.Bytes = n
-		_ = a.cat.Put(context.WithoutCancel(ctx), kindRun, run.ID, run)
+		_ = a.repo.Put(context.WithoutCancel(ctx), kindRun, run.ID, run)
 	})
 	if err != nil {
 		return err
@@ -231,6 +221,11 @@ func (a *App) backupOnce(ctx context.Context, cfg *BackupConfig, run *BackupRun)
 	run.Bytes = result.Bytes
 	run.SHA256 = result.SHA256
 	run.Codec = result.Format.Name
+	if cfg.Method == "physical" {
+		if err := a.savePhysicalResult(ctx, *cfg, run, result, store); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -286,13 +281,16 @@ func (a *App) applyRetention(ctx context.Context, cfg BackupConfig) {
 	for id := range expired {
 		run := byID[id.String()]
 		_ = store.Delete(ctx, run.FileName)
-		_ = a.cat.Delete(ctx, kindRun, run.ID)
+		if run.ManifestKey != "" {
+			_ = store.Delete(ctx, run.ManifestKey)
+		}
+		_ = a.repo.Delete(ctx, kindRun, run.ID)
 	}
 }
 
 func (a *App) OpenRun(ctx context.Context, id string) (io.ReadCloser, string, error) {
 	var run BackupRun
-	if err := a.cat.Get(ctx, kindRun, id, &run); err != nil {
+	if err := a.repo.Get(ctx, kindRun, id, &run); err != nil {
 		return nil, "", err
 	}
 	if run.Status != "success" {
@@ -322,7 +320,9 @@ func (a *App) StartArchive(ctx context.Context, in ArchiveJob) (ArchiveJob, erro
 	if _, err := a.database(ctx, in.DatabaseID); err != nil {
 		return ArchiveJob{}, err
 	}
-	if _, _, err := a.store(ctx, in.StorageID); err != nil {
+	if _, row, err := a.store(ctx, in.StorageID); err != nil {
+		return ArchiveJob{}, err
+	} else if err := rejectUnreadStorage(row); err != nil {
 		return ArchiveJob{}, err
 	}
 	db, _ := a.database(ctx, in.DatabaseID)
@@ -344,7 +344,7 @@ func (a *App) StartArchive(ctx context.Context, in ArchiveJob) (ArchiveJob, erro
 	in.ID = uuid.NewString()
 	in.Status = "running"
 	in.StartedAt = time.Now().UTC()
-	if err := a.cat.Put(ctx, kindArchive, in.ID, in); err != nil {
+	if err := a.repo.Put(ctx, kindArchive, in.ID, in); err != nil {
 		return ArchiveJob{}, err
 	}
 	detail := fmt.Sprintf("%s.%s WHERE %s", db.Name, in.Table, in.Where)
@@ -373,7 +373,28 @@ func (a *App) executeArchive(ctx context.Context, job ArchiveJob) {
 	} else {
 		job.Status = "success"
 	}
-	_ = a.cat.Put(context.WithoutCancel(ctx), kindArchive, job.ID, job)
+	_ = a.repo.Put(context.WithoutCancel(ctx), kindArchive, job.ID, job)
+	if job.PlanID != "" {
+		if plan, planErr := a.GetArchivePlan(context.WithoutCancel(ctx), job.PlanID); planErr == nil {
+			plan.LastRunAt = &now
+			_ = a.repo.Put(context.WithoutCancel(ctx), kindArchivePlan, plan.ID, plan)
+		}
+	}
+	a.notifyArchive(job)
+}
+
+func (a *App) notifyArchive(job ArchiveJob) {
+	name := a.databaseName(context.Background(), job.DatabaseID)
+	text := fmt.Sprintf("表 %s\n条件 %s\n归档 %d 行，删除 %d 行", job.Table, job.Where, job.RowsArchived, job.RowsDeleted)
+	if job.ObjectKey != "" {
+		text += "\n对象 " + job.ObjectKey
+	}
+	if job.Status == "success" {
+		a.notify(job.DatabaseID, notify.Message{Event: notify.EventArchiveSuccess, Heading: "归档成功：" + name, Text: text})
+		return
+	}
+	text += "\n错误：" + clipText(job.Error, 1500)
+	a.notify(job.DatabaseID, notify.Message{Event: notify.EventArchiveFailed, Heading: "归档失败：" + name, Text: text})
 }
 
 func (a *App) archiveOnce(ctx context.Context, job *ArchiveJob) error {
@@ -398,32 +419,56 @@ func (a *App) archiveOnce(ctx context.Context, job *ArchiveJob) error {
 			return err
 		}
 	}
-	cursor, err := archive.OpenMySQL(ctx, db.Username, db.Password, host, port, db.Database, job.Table, job.Where)
+	table, err := archive.OpenMySQL(ctx, db.Username, db.Password, host, port, db.Database, job.Table, job.Where)
 	if err != nil {
 		return err
 	}
-	defer cursor.Close()
+	defer table.Close()
 	dest, err := archiveDestination(store)
 	if err != nil {
 		return err
 	}
-	var deleter archive.Deleter
-	if job.DeleteAfter {
-		deleter = archive.MySQLDeleter{
-			User: db.Username, Password: db.Password, Host: host, Port: port,
-			Database: db.Database, Table: job.Table, Where: job.Where,
-		}
-	}
 	pause := time.Duration(job.PauseMS) * time.Millisecond
+	var lastPersist time.Time
 	result, err := archive.Run(ctx, archive.Request{
 		Database: db.Database, Table: job.Table, Where: job.Where, Year: job.Year,
 		BatchSize: job.BatchSize, DeleteAfter: job.DeleteAfter,
-	}, cursor, dest, deleter, func() { time.Sleep(pause) })
+	}, table, dest, func() { time.Sleep(pause) }, func(p archive.Progress) {
+		job.Phase = p.Phase
+		job.RowsArchived = p.RowsArchived
+		job.RowsDeleted = p.RowsDeleted
+		if p.ObjectKey != "" {
+			job.ObjectKey = p.ObjectKey
+		}
+		if p.MD5 != "" {
+			job.MD5 = p.MD5
+		}
+		now := time.Now()
+		if now.Sub(lastPersist) < 2*time.Second && p.Phase != archive.PhaseDone {
+			return
+		}
+		lastPersist = now
+		_ = a.repo.Put(context.WithoutCancel(ctx), kindArchive, job.ID, *job)
+	})
 	job.ObjectKey = result.Key
+	if len(result.Keys) > 0 {
+		job.ObjectKeys = result.Keys
+		job.ObjectKey = result.Keys[len(result.Keys)-1]
+	}
 	job.MD5 = result.MD5
 	job.RowsArchived = result.RowsArchived
 	job.RowsDeleted = result.RowsDeleted
+	if err == nil {
+		job.Phase = archive.PhaseDone
+	}
 	return err
+}
+
+func rejectUnreadStorage(row Storage) error {
+	if strings.EqualFold(row.Type, storage.TypeGoogleDrive) {
+		return fmt.Errorf("table archive needs a storage that can be read back for MD5; Google Drive reads are not implemented")
+	}
+	return nil
 }
 
 func archiveDestination(store storage.Store) (archive.Destination, error) {
@@ -447,7 +492,7 @@ func (d storeDest) Exists(ctx context.Context, key string) (bool, error) {
 
 func (a *App) ListArchives(ctx context.Context) ([]ArchiveJob, error) {
 	var rows []ArchiveJob
-	if err := a.cat.List(ctx, kindArchive, &rows); err != nil {
+	if err := a.repo.List(ctx, kindArchive, &rows); err != nil {
 		return nil, err
 	}
 	if rows == nil {
@@ -456,10 +501,151 @@ func (a *App) ListArchives(ctx context.Context) ([]ArchiveJob, error) {
 	return rows, nil
 }
 
+func (a *App) CreateArchivePlan(ctx context.Context, in ArchivePlan) (ArchivePlan, error) {
+	db, err := a.database(ctx, in.DatabaseID)
+	if err != nil {
+		return ArchivePlan{}, err
+	}
+	if db.Engine != engine.MySQL && db.Engine != engine.MariaDB {
+		return ArchivePlan{}, fmt.Errorf("table archive reads a MySQL or MariaDB cursor")
+	}
+	if _, row, err := a.store(ctx, in.StorageID); err != nil {
+		return ArchivePlan{}, err
+	} else if err := rejectUnreadStorage(row); err != nil {
+		return ArchivePlan{}, err
+	}
+	if in.Name == "" {
+		return ArchivePlan{}, fmt.Errorf("name is required")
+	}
+	if err := sqlident.ValidatePredicate(in.Where); err != nil {
+		return ArchivePlan{}, err
+	}
+	year := in.Year
+	if year == 0 {
+		year = time.Now().UTC().Year()
+	}
+	if _, err := archive.ObjectKey(db.Database, in.Table, year, ""); err != nil {
+		return ArchivePlan{}, err
+	}
+	if err := in.Schedule.Validate(); err != nil {
+		return ArchivePlan{}, err
+	}
+	if in.BatchSize <= 0 {
+		in.BatchSize = 5000
+	}
+	if in.PauseMS <= 0 {
+		in.PauseMS = 200
+	}
+	in.ID = uuid.NewString()
+	in.Enabled = true
+	in.CreatedAt = time.Now().UTC()
+	if err := a.repo.Put(ctx, kindArchivePlan, in.ID, in); err != nil {
+		return ArchivePlan{}, err
+	}
+	a.Audit(ctx, "archive.plan.create", fmt.Sprintf("%s → %s.%s", in.Name, db.Name, in.Table))
+	return in, nil
+}
+
+func (a *App) ListArchivePlans(ctx context.Context) ([]ArchivePlan, error) {
+	var rows []ArchivePlan
+	if err := a.repo.List(ctx, kindArchivePlan, &rows); err != nil {
+		return nil, err
+	}
+	if rows == nil {
+		rows = []ArchivePlan{}
+	}
+	return rows, nil
+}
+
+func (a *App) GetArchivePlan(ctx context.Context, id string) (ArchivePlan, error) {
+	var plan ArchivePlan
+	err := a.repo.Get(ctx, kindArchivePlan, id, &plan)
+	return plan, err
+}
+
+func (a *App) DeleteArchivePlan(ctx context.Context, id string) error {
+	plan, err := a.GetArchivePlan(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := a.repo.Delete(ctx, kindArchivePlan, id); err != nil {
+		return err
+	}
+	a.Audit(ctx, "archive.plan.delete", plan.Name)
+	return nil
+}
+
+// UpdateArchivePlan replaces schedule fields and the enabled flag. LastRunAt stays.
+func (a *App) UpdateArchivePlan(ctx context.Context, id string, in ArchivePlan) (ArchivePlan, error) {
+	existing, err := a.GetArchivePlan(ctx, id)
+	if err != nil {
+		return ArchivePlan{}, err
+	}
+	db, err := a.database(ctx, in.DatabaseID)
+	if err != nil {
+		return ArchivePlan{}, err
+	}
+	if db.Engine != engine.MySQL && db.Engine != engine.MariaDB {
+		return ArchivePlan{}, fmt.Errorf("table archive reads a MySQL or MariaDB cursor")
+	}
+	if _, row, err := a.store(ctx, in.StorageID); err != nil {
+		return ArchivePlan{}, err
+	} else if err := rejectUnreadStorage(row); err != nil {
+		return ArchivePlan{}, err
+	}
+	if in.Name == "" {
+		return ArchivePlan{}, fmt.Errorf("name is required")
+	}
+	if err := sqlident.ValidatePredicate(in.Where); err != nil {
+		return ArchivePlan{}, err
+	}
+	if err := in.Schedule.Validate(); err != nil {
+		return ArchivePlan{}, err
+	}
+	if in.BatchSize <= 0 {
+		in.BatchSize = 5000
+	}
+	if in.PauseMS <= 0 {
+		in.PauseMS = 200
+	}
+	in.ID = existing.ID
+	in.CreatedAt = existing.CreatedAt
+	in.LastRunAt = existing.LastRunAt
+	if err := a.repo.Put(ctx, kindArchivePlan, in.ID, in); err != nil {
+		return ArchivePlan{}, err
+	}
+	a.Audit(ctx, "archive.plan.update", in.Name)
+	return in, nil
+}
+
+func (a *App) RunArchivePlan(ctx context.Context, id string) (ArchiveJob, error) {
+	plan, err := a.GetArchivePlan(ctx, id)
+	if err != nil {
+		return ArchiveJob{}, err
+	}
+	year := plan.Year
+	if year == 0 {
+		year = time.Now().UTC().Year()
+	}
+	job, err := a.StartArchive(ctx, ArchiveJob{
+		PlanID: plan.ID, DatabaseID: plan.DatabaseID, StorageID: plan.StorageID,
+		Table: plan.Table, Where: plan.Where, Year: year,
+		BatchSize: plan.BatchSize, PauseMS: plan.PauseMS, DeleteAfter: plan.DeleteAfter,
+	})
+	if err != nil {
+		return ArchiveJob{}, err
+	}
+	a.Audit(ctx, "archive.plan.run", plan.Name)
+	return job, nil
+}
+
 func (a *App) ColdQuery(ctx context.Context, in ColdRequest) ([]coldquery.Row, error) {
 	db, err := a.database(ctx, in.DatabaseID)
 	if err != nil {
 		return nil, err
+	}
+	if db.Engine != engine.MySQL && db.Engine != engine.MariaDB {
+		return nil, fmt.Errorf("cold query reads MySQL or MariaDB archives")
 	}
 	store, row, err := a.store(ctx, in.StorageID)
 	if err != nil {
@@ -476,8 +662,10 @@ func (a *App) ColdQuery(ctx context.Context, in ColdRequest) ([]coldquery.Row, e
 		req.SecretKey = settings.SecretKey
 		req.PathStyle = !settings.VirtualHost
 		req.UseSSL = !strings.HasPrefix(settings.Endpoint, "http://")
+		req.SkipTLS = settings.SkipTLS
+		req.Prefix = settings.Prefix
 	} else {
-		return nil, fmt.Errorf("cold query reads a local directory or an S3/Qiniu bucket (%s is %s)", row.Name, row.Type)
+		return nil, fmt.Errorf("cold query reads a filesystem, S3, Qiniu, OSS or GCS archive (%s is %s)", row.Name, row.Type)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
@@ -511,7 +699,7 @@ func (a *App) StartDDL(ctx context.Context, in DDLRun) (DDLRun, error) {
 	in.ID = uuid.NewString()
 	in.Status = "running"
 	in.StartedAt = time.Now().UTC()
-	if err := a.cat.Put(ctx, kindDDL, in.ID, in); err != nil {
+	if err := a.repo.Put(ctx, kindDDL, in.ID, in); err != nil {
 		return DDLRun{}, err
 	}
 	mode := "dry run"
@@ -546,6 +734,7 @@ func (a *App) executeDDL(ctx context.Context, db Database, run DDLRun, database 
 		_ = release
 	}
 	var log strings.Builder
+	var lastPersist time.Time
 	err := onlineddl.Run(ctx, onlineddl.Request{
 		Host: host, Port: port, User: db.Username, Password: db.Password,
 		Database: database, Statement: run.Statement, Tool: run.Tool,
@@ -566,7 +755,12 @@ func (a *App) executeDDL(ctx context.Context, db Database, run DDLRun, database 
 		}
 		payload, _ := json.Marshal(event)
 		a.hub.Publish(run.ID, payload)
-		_ = a.cat.Put(context.WithoutCancel(ctx), kindDDL, run.ID, run)
+		now := time.Now()
+		if now.Sub(lastPersist) < 2*time.Second {
+			return
+		}
+		lastPersist = now
+		_ = a.repo.Put(context.WithoutCancel(ctx), kindDDL, run.ID, run)
 	})
 	a.finishDDL(ctx, run, err)
 }
@@ -584,14 +778,29 @@ func (a *App) finishDDL(ctx context.Context, run DDLRun, err error) {
 		}
 	}
 	run.Status = status
-	_ = a.cat.Put(context.WithoutCancel(ctx), kindDDL, run.ID, run)
+	_ = a.repo.Put(context.WithoutCancel(ctx), kindDDL, run.ID, run)
 	payload, _ := json.Marshal(map[string]any{"kind": "done", "status": status, "error": run.Error})
 	a.hub.Publish(run.ID, payload)
+	a.notifyDDL(run)
+}
+
+func (a *App) notifyDDL(run DDLRun) {
+	name := a.databaseName(context.Background(), run.DatabaseID)
+	text := fmt.Sprintf("语句 %s\n工具 %s", run.Statement, run.Tool)
+	if run.Percent > 0 {
+		text += fmt.Sprintf("\n进度 %.1f%%", run.Percent)
+	}
+	if run.Status == "success" {
+		a.notify(run.DatabaseID, notify.Message{Event: notify.EventDDLSuccess, Heading: "结构变更成功：" + name, Text: text})
+		return
+	}
+	text += "\n错误：" + clipText(run.Error, 1500)
+	a.notify(run.DatabaseID, notify.Message{Event: notify.EventDDLFailed, Heading: "结构变更失败：" + name, Text: text})
 }
 
 func (a *App) ListDDL(ctx context.Context) ([]DDLRun, error) {
 	var rows []DDLRun
-	if err := a.cat.List(ctx, kindDDL, &rows); err != nil {
+	if err := a.repo.List(ctx, kindDDL, &rows); err != nil {
 		return nil, err
 	}
 	if rows == nil {
@@ -602,7 +811,7 @@ func (a *App) ListDDL(ctx context.Context) ([]DDLRun, error) {
 
 func (a *App) GetDDL(ctx context.Context, id string) (DDLRun, error) {
 	var run DDLRun
-	err := a.cat.Get(ctx, kindDDL, id, &run)
+	err := a.repo.Get(ctx, kindDDL, id, &run)
 	return run, err
 }
 
@@ -610,18 +819,23 @@ func (a *App) DDLEvents(id string) (<-chan []byte, func()) { return a.hub.Subscr
 
 func (a *App) DeleteRun(ctx context.Context, id string) error {
 	var run BackupRun
-	if err := a.cat.Get(ctx, kindRun, id, &run); err != nil {
+	if err := a.repo.Get(ctx, kindRun, id, &run); err != nil {
 		return err
 	}
 	if run.Status == "running" {
 		return fmt.Errorf("backup is running")
 	}
-	if run.FileName != "" {
+	if run.FileName != "" || run.ManifestKey != "" {
 		if store, _, err := a.store(ctx, run.StorageID); err == nil {
-			_ = store.Delete(ctx, run.FileName)
+			if run.FileName != "" {
+				_ = store.Delete(ctx, run.FileName)
+			}
+			if run.ManifestKey != "" {
+				_ = store.Delete(ctx, run.ManifestKey)
+			}
 		}
 	}
-	if err := a.cat.Delete(ctx, kindRun, id); err != nil {
+	if err := a.repo.Delete(ctx, kindRun, id); err != nil {
 		return err
 	}
 	a.Audit(ctx, "backup.delete", run.FileName)
@@ -630,7 +844,7 @@ func (a *App) DeleteRun(ctx context.Context, id string) error {
 
 func (a *App) ListRestores(ctx context.Context) ([]RestoreRun, error) {
 	var rows []RestoreRun
-	if err := a.cat.List(ctx, kindRestore, &rows); err != nil {
+	if err := a.repo.List(ctx, kindRestore, &rows); err != nil {
 		return nil, err
 	}
 	if rows == nil {
@@ -641,7 +855,7 @@ func (a *App) ListRestores(ctx context.Context) ([]RestoreRun, error) {
 
 func (a *App) StartRestore(ctx context.Context, backupID string, target RestoreTarget) (RestoreRun, error) {
 	var run BackupRun
-	if err := a.cat.Get(ctx, kindRun, backupID, &run); err != nil {
+	if err := a.repo.Get(ctx, kindRun, backupID, &run); err != nil {
 		return RestoreRun{}, err
 	}
 	if run.Status != "success" {
@@ -654,6 +868,7 @@ func (a *App) StartRestore(ctx context.Context, backupID string, target RestoreT
 	if target.Host == "" || target.Port == 0 || target.Username == "" || target.Database == "" {
 		return RestoreRun{}, fmt.Errorf("restore target needs host, port, username and database")
 	}
+	clampRestoreParallel(run.Codec, &target)
 	job := RestoreRun{
 		ID:         uuid.NewString(),
 		BackupID:   run.ID,
@@ -663,7 +878,7 @@ func (a *App) StartRestore(ctx context.Context, backupID string, target RestoreT
 		Status:     "running",
 		StartedAt:  time.Now().UTC(),
 	}
-	if err := a.cat.Put(ctx, kindRestore, job.ID, job); err != nil {
+	if err := a.repo.Put(ctx, kindRestore, job.ID, job); err != nil {
 		return RestoreRun{}, err
 	}
 	a.Audit(ctx, "restore.start", fmt.Sprintf("%s → %s:%d/%s", run.FileName, target.Host, target.Port, target.Database))
@@ -675,9 +890,10 @@ func (a *App) StartRestore(ctx context.Context, backupID string, target RestoreT
 
 func (a *App) executeRestore(ctx context.Context, run BackupRun, job RestoreRun, target RestoreTarget) {
 	defer a.untrack(job.ID)
-	err := a.restoreOnce(ctx, run, target)
+	report, err := a.restoreOnce(ctx, run, target)
 	now := time.Now().UTC()
 	job.FinishedAt = &now
+	job.Report = report
 	cancelled := ctx.Err() != nil
 	if err != nil {
 		job.Status = "failed"
@@ -689,12 +905,15 @@ func (a *App) executeRestore(ctx context.Context, run BackupRun, job RestoreRun,
 	} else {
 		job.Status = "success"
 	}
-	_ = a.cat.Put(context.WithoutCancel(ctx), kindRestore, job.ID, job)
+	_ = a.repo.Put(context.WithoutCancel(ctx), kindRestore, job.ID, job)
 	if cancelled {
 		return
 	}
 	name := a.databaseName(context.WithoutCancel(ctx), run.DatabaseID)
 	text := fmt.Sprintf("目标：%s:%d/%s\n备份：%s", target.Host, target.Port, target.Database, run.FileName)
+	if report != "" {
+		text += "\n校验：" + report
+	}
 	if job.Status == "success" {
 		a.notify(run.DatabaseID, notify.Message{Event: notify.EventRestoreSuccess, Heading: "恢复成功：" + name, Text: text})
 		return
@@ -702,10 +921,10 @@ func (a *App) executeRestore(ctx context.Context, run BackupRun, job RestoreRun,
 	a.notify(run.DatabaseID, notify.Message{Event: notify.EventRestoreFailed, Heading: "恢复失败：" + name, Text: text + "\n错误：" + clipText(job.Error, 1500)})
 }
 
-func (a *App) restoreOnce(ctx context.Context, run BackupRun, target RestoreTarget) error {
+func (a *App) restoreOnce(ctx context.Context, run BackupRun, target RestoreTarget) (string, error) {
 	body, _, err := a.OpenRun(ctx, run.ID)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer body.Close()
 	src := engine.Source{
@@ -716,9 +935,23 @@ func (a *App) restoreOnce(ctx context.Context, run BackupRun, target RestoreTarg
 		Password: target.Password,
 		Database: target.Database,
 		SSL:      target.SSL,
+		Parallel: target.Parallel,
 	}
 	format := engine.Format{Name: run.Codec, CompressInPipeline: run.Codec == "mysql-sql" || run.Codec == "mariadb-sql"}
-	return engine.Restore(ctx, src, format, body)
+	if err := engine.Restore(ctx, src, format, body); err != nil {
+		return "", err
+	}
+	if !target.Verify {
+		return "", nil
+	}
+	report, err := verifyRestore(ctx, src)
+	return report, err
+}
+
+func clampRestoreParallel(codec string, target *RestoreTarget) {
+	if codec != "pg-custom" {
+		target.Parallel = 0
+	}
 }
 
 func restoreEngine(codec string) (string, error) {
@@ -747,6 +980,7 @@ func restoreEngineName(codec string) string {
 }
 
 func (a *App) Schedule(ctx context.Context) {
+	a.startEnabledWalStreamers(ctx)
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -755,6 +989,18 @@ func (a *App) Schedule(ctx context.Context) {
 			return
 		case <-ticker.C:
 			a.schedulePass(ctx)
+		}
+	}
+}
+
+func (a *App) startEnabledWalStreamers(ctx context.Context) {
+	configs, err := a.ListConfigs(ctx)
+	if err != nil {
+		return
+	}
+	for _, cfg := range configs {
+		if cfg.Enabled && cfg.Method == "physical" && cfg.WalEnabled {
+			a.ensureWalStreamer(cfg)
 		}
 	}
 }
@@ -781,6 +1027,38 @@ func (a *App) schedulePass(ctx context.Context) {
 		if !due && !retry {
 			continue
 		}
-		_, _ = a.startBackup(ctx, cfg.ID)
+		_, _ = a.startBackup(ctx, cfg.ID, false)
+	}
+	a.scheduleArchivePass(ctx, now)
+}
+
+func (a *App) scheduleArchivePass(ctx context.Context, now time.Time) {
+	plans, err := a.ListArchivePlans(ctx)
+	if err != nil {
+		return
+	}
+	jobs, _ := a.ListArchives(ctx)
+	running := map[string]bool{}
+	for _, job := range jobs {
+		if job.Status == "running" && job.PlanID != "" {
+			running[job.PlanID] = true
+		}
+	}
+	for _, plan := range plans {
+		if !plan.Enabled || running[plan.ID] {
+			continue
+		}
+		if !plan.Schedule.IsDue(now, plan.LastRunAt) {
+			continue
+		}
+		year := plan.Year
+		if year == 0 {
+			year = now.Year()
+		}
+		_, _ = a.StartArchive(ctx, ArchiveJob{
+			PlanID: plan.ID, DatabaseID: plan.DatabaseID, StorageID: plan.StorageID,
+			Table: plan.Table, Where: plan.Where, Year: year,
+			BatchSize: plan.BatchSize, PauseMS: plan.PauseMS, DeleteAfter: plan.DeleteAfter,
+		})
 	}
 }

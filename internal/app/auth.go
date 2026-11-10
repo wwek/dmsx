@@ -65,12 +65,28 @@ func (a *App) ResetOperatorPassword(ctx context.Context, password string) error 
 	return nil
 }
 
+// ChangeOperatorPassword checks the current password, then replaces it and
+// invalidates every open browser session.
+func (a *App) ChangeOperatorPassword(ctx context.Context, current, next string) error {
+	if err := a.CheckOperatorPassword(ctx, current); err != nil {
+		return err
+	}
+	if err := checkPasswordLength(next); err != nil {
+		return err
+	}
+	if err := a.writeOperator(ctx, next); err != nil {
+		return err
+	}
+	a.Audit(ctx, "operator.password", "password changed from the console")
+	return nil
+}
+
 func (a *App) writeOperator(ctx context.Context, password string) error {
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return err
 	}
-	return a.cat.Put(ctx, kindOperator, operatorID, operatorRecord{PasswordHash: string(hash), ChangedAt: time.Now().UTC()})
+	return a.repo.Put(ctx, kindOperator, operatorID, operatorRecord{PasswordHash: string(hash), ChangedAt: time.Now().UTC()})
 }
 
 func (a *App) CheckOperatorPassword(ctx context.Context, password string) error {
@@ -98,7 +114,7 @@ func (a *App) PasswordChangedAt(ctx context.Context) time.Time {
 
 func (a *App) readOperator(ctx context.Context) (operatorRecord, error) {
 	var record operatorRecord
-	err := a.cat.Get(ctx, kindOperator, operatorID, &record)
+	err := a.repo.Get(ctx, kindOperator, operatorID, &record)
 	return record, err
 }
 

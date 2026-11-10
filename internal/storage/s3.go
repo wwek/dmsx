@@ -47,6 +47,50 @@ var qiniuEndpoints = map[string]string{
 	"ap-southeast-1": "s3-ap-southeast-1.qiniucs.com",
 }
 
+func defaultGCS(raw json.RawMessage) json.RawMessage {
+	var settings S3Settings
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		return raw
+	}
+	if settings.Endpoint == "" {
+		settings.Endpoint = "https://storage.googleapis.com"
+		settings.VirtualHost = true
+	}
+	out, err := json.Marshal(settings)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+func defaultOSS(raw json.RawMessage) json.RawMessage {
+	var settings S3Settings
+	if err := json.Unmarshal(raw, &settings); err != nil {
+		return raw
+	}
+	if settings.Endpoint == "" && settings.Region != "" {
+		settings.Endpoint = "https://oss-" + settings.Region + ".aliyuncs.com"
+		settings.VirtualHost = true
+	}
+	out, err := json.Marshal(settings)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+func newOSS(raw json.RawMessage) (Store, error) {
+	prepared := defaultOSS(raw)
+	var settings S3Settings
+	if err := json.Unmarshal(prepared, &settings); err != nil {
+		return nil, err
+	}
+	if settings.Endpoint == "" {
+		return nil, fmt.Errorf("oss region or endpoint is required")
+	}
+	return newS3(prepared, false)
+}
+
 func newS3(raw json.RawMessage, qiniu bool) (Store, error) {
 	var settings S3Settings
 	if err := json.Unmarshal(raw, &settings); err != nil {

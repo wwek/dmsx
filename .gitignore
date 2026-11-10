@@ -3,4 +3,6 @@
 /bin/
 /dist/
 /internal/onlineddl/gh-ost
+/web/node_modules
+/web/dist
 

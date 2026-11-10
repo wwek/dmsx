@@ -5,10 +5,26 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"dmsx/internal/archive"
 )
+
+func TestS3GlobUsesPrefixAndSkipTLS(t *testing.T) {
+	glob, err := sourceGlob(Request{Database: "shop", Table: "orders", Bucket: "bucket", Prefix: "tenant/a"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if glob != "s3://bucket/tenant/a/dms_archives/shop/orders/*.parquet" {
+		t.Fatal(glob)
+	}
+	statements := s3Statements(Request{Endpoint: "https://minio.local", SkipTLS: true, UseSSL: true})
+	joined := strings.Join(statements, "\n")
+	if !strings.Contains(joined, "SET enable_server_cert_verification=false") || !strings.Contains(joined, "SET s3_use_ssl=true") {
+		t.Fatal(joined)
+	}
+}
 
 func TestLocalParquetQuery(t *testing.T) {
 	dir := t.TempDir()

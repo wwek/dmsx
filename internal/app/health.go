@@ -28,7 +28,7 @@ func (a *App) Watch(ctx context.Context) {
 			delete(inflight, id)
 		case <-ticker.C:
 			var rows []Database
-			if err := a.cat.List(ctx, kindDatabase, &rows); err != nil {
+			if err := a.repo.List(ctx, kindDatabase, &rows); err != nil {
 				continue
 			}
 			now := time.Now().UTC()
@@ -75,7 +75,7 @@ func (a *App) probe(ctx context.Context, id string) {
 
 	a.healthMu.Lock()
 	var current Database
-	if a.cat.Get(ctx, kindDatabase, id, &current) != nil {
+	if a.repo.Get(ctx, kindDatabase, id, &current) != nil {
 		a.healthMu.Unlock()
 		return
 	}
@@ -83,7 +83,7 @@ func (a *App) probe(ctx context.Context, id string) {
 	state := a.healthState(ctx, id)
 	previous := state.Status
 	next, changed := config.Record(&state, attempt)
-	_ = a.cat.Put(ctx, kindHealth, id, state)
+	_ = a.repo.Put(ctx, kindHealth, id, state)
 	a.healthMu.Unlock()
 
 	if !changed || !config.Notify || previous == healthcheck.StatusUnknown && next == healthcheck.StatusAvailable {
@@ -106,7 +106,7 @@ func (a *App) probe(ctx context.Context, id string) {
 
 func (a *App) healthState(ctx context.Context, id string) healthcheck.State {
 	var state healthcheck.State
-	if a.cat.Get(ctx, kindHealth, id, &state) != nil {
+	if a.repo.Get(ctx, kindHealth, id, &state) != nil {
 		return healthcheck.State{DatabaseID: id}
 	}
 	return state
@@ -116,7 +116,7 @@ func (a *App) healthState(ctx context.Context, id string) healthcheck.State {
 // attempts.
 func (a *App) ListHealth(ctx context.Context) ([]healthcheck.State, error) {
 	var rows []Database
-	if err := a.cat.List(ctx, kindDatabase, &rows); err != nil {
+	if err := a.repo.List(ctx, kindDatabase, &rows); err != nil {
 		return nil, err
 	}
 	out := make([]healthcheck.State, 0, len(rows))
@@ -140,11 +140,11 @@ func (a *App) SetHealthCheck(ctx context.Context, id string, config healthcheck.
 	a.healthMu.Lock()
 	defer a.healthMu.Unlock()
 	var db Database
-	if err := a.cat.Get(ctx, kindDatabase, id, &db); err != nil {
+	if err := a.repo.Get(ctx, kindDatabase, id, &db); err != nil {
 		return Database{}, err
 	}
 	db.HealthCheck = &config
-	if err := a.cat.Put(ctx, kindDatabase, id, db); err != nil {
+	if err := a.repo.Put(ctx, kindDatabase, id, db); err != nil {
 		return Database{}, err
 	}
 	state := "off"

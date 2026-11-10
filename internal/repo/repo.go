@@ -1,6 +1,7 @@
-// Package catalog stores dmsx's own records in SQLite. Backup payloads are not
-// stored here; this database only remembers connections, schedules and outcomes.
-package catalog
+// Package repo is dmsx's metadata store (SQLite). It holds connections, plans,
+// runs and other console records. Backup and archive payloads are not stored
+// here; those bytes go to object storage.
+package repo
 
 import (
 	"context"
@@ -13,9 +14,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-type Catalog struct{ db *sql.DB }
+// Repo is the SQLite-backed metadata repository for one dmsx data directory.
+type Repo struct{ db *sql.DB }
 
-func Open(path string) (*Catalog, error) {
+func Open(path string) (*Repo, error) {
 	dsn := "file:" + path + "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -32,25 +34,25 @@ func Open(path string) (*Catalog, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Catalog{db: db}, nil
+	return &Repo{db: db}, nil
 }
 
-func (c *Catalog) Close() error { return c.db.Close() }
+func (r *Repo) Close() error { return r.db.Close() }
 
-func (c *Catalog) Put(ctx context.Context, kind, id string, value any) error {
+func (r *Repo) Put(ctx context.Context, kind, id string, value any) error {
 	body, err := json.Marshal(value)
 	if err != nil {
 		return err
 	}
-	_, err = c.db.ExecContext(ctx, `INSERT INTO records(kind, id, body, updated_at) VALUES(?, ?, ?, ?)
+	_, err = r.db.ExecContext(ctx, `INSERT INTO records(kind, id, body, updated_at) VALUES(?, ?, ?, ?)
 		ON CONFLICT(kind, id) DO UPDATE SET body = excluded.body, updated_at = excluded.updated_at`,
 		kind, id, string(body), time.Now().UTC().Format(time.RFC3339Nano))
 	return err
 }
 
-func (c *Catalog) Get(ctx context.Context, kind, id string, dest any) error {
+func (r *Repo) Get(ctx context.Context, kind, id string, dest any) error {
 	var body string
-	err := c.db.QueryRowContext(ctx, `SELECT body FROM records WHERE kind = ? AND id = ?`, kind, id).Scan(&body)
+	err := r.db.QueryRowContext(ctx, `SELECT body FROM records WHERE kind = ? AND id = ?`, kind, id).Scan(&body)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%s %s not found", kind, id)
 	}
@@ -60,8 +62,8 @@ func (c *Catalog) Get(ctx context.Context, kind, id string, dest any) error {
 	return json.Unmarshal([]byte(body), dest)
 }
 
-func (c *Catalog) List(ctx context.Context, kind string, dest any) error {
-	rows, err := c.db.QueryContext(ctx, `SELECT body FROM records WHERE kind = ? ORDER BY updated_at DESC`, kind)
+func (r *Repo) List(ctx context.Context, kind string, dest any) error {
+	rows, err := r.db.QueryContext(ctx, `SELECT body FROM records WHERE kind = ? ORDER BY updated_at DESC`, kind)
 	if err != nil {
 		return err
 	}
@@ -88,13 +90,13 @@ func (c *Catalog) List(ctx context.Context, kind string, dest any) error {
 }
 
 // Prune keeps the keep most recently written records of kind.
-func (c *Catalog) Prune(ctx context.Context, kind string, keep int) error {
-	_, err := c.db.ExecContext(ctx, `DELETE FROM records WHERE kind = ? AND id NOT IN (
+func (r *Repo) Prune(ctx context.Context, kind string, keep int) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM records WHERE kind = ? AND id NOT IN (
 		SELECT id FROM records WHERE kind = ? ORDER BY updated_at DESC LIMIT ?)`, kind, kind, keep)
 	return err
 }
 
-func (c *Catalog) Delete(ctx context.Context, kind, id string) error {
-	_, err := c.db.ExecContext(ctx, `DELETE FROM records WHERE kind = ? AND id = ?`, kind, id)
+func (r *Repo) Delete(ctx context.Context, kind, id string) error {
+	_, err := r.db.ExecContext(ctx, `DELETE FROM records WHERE kind = ? AND id = ?`, kind, id)
 	return err
 }

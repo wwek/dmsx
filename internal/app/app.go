@@ -12,20 +12,21 @@ import (
 
 	"github.com/google/uuid"
 
-	"dmsx/internal/catalog"
 	"dmsx/internal/engine"
+	"dmsx/internal/repo"
 	"dmsx/internal/secret"
 	"dmsx/internal/sqlident"
 	"dmsx/internal/storage"
 )
 
 type App struct {
-	cat    *catalog.Catalog
-	box    *secret.Box
-	master string
-	root   context.Context
-	cancel context.CancelFunc
-	hub    *hub
+	repo    *repo.Repo
+	box     *secret.Box
+	master  string
+	dataDir string
+	root    context.Context
+	cancel  context.CancelFunc
+	hub     *hub
 
 	mu      sync.Mutex
 	cancels map[string]context.CancelFunc
@@ -47,15 +48,16 @@ func Open(dataDir string) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	cat, err := catalog.Open(filepath.Join(dataDir, "dmsx.db"))
+	repoStore, err := repo.Open(filepath.Join(dataDir, "dmsx.db"))
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	application := &App{
-		cat:     cat,
+		repo:    repoStore,
 		box:     box,
 		master:  strings.TrimSpace(string(raw)),
+		dataDir: dataDir,
 		root:    ctx,
 		cancel:  cancel,
 		hub:     newHub(),
@@ -67,49 +69,49 @@ func Open(dataDir string) (*App, error) {
 
 func (a *App) Close() error {
 	a.cancel()
-	return a.cat.Close()
+	return a.repo.Close()
 }
 
 func (a *App) recoverInterrupted() {
 	now := time.Now().UTC()
 	var runs []BackupRun
-	_ = a.cat.List(context.Background(), kindRun, &runs)
+	_ = a.repo.List(context.Background(), kindRun, &runs)
 	for _, run := range runs {
 		if run.Status == "running" {
 			run.Status = "failed"
 			run.Error = "dmsx stopped before the run finished"
 			run.FinishedAt = &now
-			_ = a.cat.Put(context.Background(), kindRun, run.ID, run)
+			_ = a.repo.Put(context.Background(), kindRun, run.ID, run)
 		}
 	}
 	var jobs []ArchiveJob
-	_ = a.cat.List(context.Background(), kindArchive, &jobs)
+	_ = a.repo.List(context.Background(), kindArchive, &jobs)
 	for _, job := range jobs {
 		if job.Status == "running" {
 			job.Status = "failed"
 			job.Error = "dmsx stopped before the archive finished"
 			job.FinishedAt = &now
-			_ = a.cat.Put(context.Background(), kindArchive, job.ID, job)
+			_ = a.repo.Put(context.Background(), kindArchive, job.ID, job)
 		}
 	}
 	var ddls []DDLRun
-	_ = a.cat.List(context.Background(), kindDDL, &ddls)
+	_ = a.repo.List(context.Background(), kindDDL, &ddls)
 	for _, run := range ddls {
 		if run.Status == "running" {
 			run.Status = "failed"
 			run.Error = "dmsx stopped before the DDL finished"
 			run.FinishedAt = &now
-			_ = a.cat.Put(context.Background(), kindDDL, run.ID, run)
+			_ = a.repo.Put(context.Background(), kindDDL, run.ID, run)
 		}
 	}
 	var restores []RestoreRun
-	_ = a.cat.List(context.Background(), kindRestore, &restores)
+	_ = a.repo.List(context.Background(), kindRestore, &restores)
 	for _, run := range restores {
 		if run.Status == "running" {
 			run.Status = "failed"
 			run.Error = "dmsx stopped before the restore finished"
 			run.FinishedAt = &now
-			_ = a.cat.Put(context.Background(), kindRestore, run.ID, run)
+			_ = a.repo.Put(context.Background(), kindRestore, run.ID, run)
 		}
 	}
 }
@@ -135,7 +137,7 @@ func (a *App) CreateDatabase(ctx context.Context, in Database) (Database, error)
 			return Database{}, err
 		}
 	}
-	if err := a.cat.Put(ctx, kindDatabase, in.ID, in); err != nil {
+	if err := a.repo.Put(ctx, kindDatabase, in.ID, in); err != nil {
 		return Database{}, err
 	}
 	a.Audit(ctx, "database.create", fmt.Sprintf("%s (%s %s:%d/%s)", in.Name, in.Engine, in.Host, in.Port, in.Database))
@@ -144,7 +146,7 @@ func (a *App) CreateDatabase(ctx context.Context, in Database) (Database, error)
 
 // CreateBackupUser creates a login on the server that can back up and cannot
 // write, and switches the stored connection to it. The new password is sealed
-// in the catalog and is not returned.
+// in the metadata repo and is not returned.
 func (a *App) CreateBackupUser(ctx context.Context, id string, replication bool) (Database, error) {
 	db, err := a.database(ctx, id)
 	if err != nil {
@@ -171,12 +173,12 @@ func (a *App) CreateBackupUser(ctx context.Context, id string, replication bool)
 		return Database{}, err
 	}
 	a.healthMu.Lock()
-	err = a.cat.Get(ctx, kindDatabase, id, &db)
+	err = a.repo.Get(ctx, kindDatabase, id, &db)
 	if err == nil {
 		db.Username = user.Username
 		db.Password = sealed
 		db.HasPassword = true
-		err = a.cat.Put(ctx, kindDatabase, db.ID, db)
+		err = a.repo.Put(ctx, kindDatabase, db.ID, db)
 	}
 	a.healthMu.Unlock()
 	if err != nil {
@@ -192,7 +194,7 @@ func (a *App) CreateBackupUser(ctx context.Context, id string, replication bool)
 
 func (a *App) ListDatabases(ctx context.Context) ([]Database, error) {
 	var rows []Database
-	if err := a.cat.List(ctx, kindDatabase, &rows); err != nil {
+	if err := a.repo.List(ctx, kindDatabase, &rows); err != nil {
 		return nil, err
 	}
 	if rows == nil {
@@ -216,7 +218,7 @@ func (a *App) DeleteDatabase(ctx context.Context, id string) error {
 		if run.Status == "running" {
 			a.Cancel(run.ID)
 			run.Status = "cancelled"
-			if err := a.cat.Put(ctx, kindRun, run.ID, run); err != nil {
+			if err := a.repo.Put(ctx, kindRun, run.ID, run); err != nil {
 				return err
 			}
 		}
@@ -230,16 +232,27 @@ func (a *App) DeleteDatabase(ctx context.Context, id string) error {
 	}
 	for _, cfg := range configs {
 		if cfg.DatabaseID == id {
-			if err := a.cat.Delete(ctx, kindConfig, cfg.ID); err != nil {
+			if err := a.repo.Delete(ctx, kindConfig, cfg.ID); err != nil {
 				return err
 			}
 		}
 	}
-	if err := a.cat.Delete(ctx, kindHealth, id); err != nil {
+	plans, err := a.ListArchivePlans(ctx)
+	if err != nil {
+		return err
+	}
+	for _, plan := range plans {
+		if plan.DatabaseID == id {
+			if err := a.repo.Delete(ctx, kindArchivePlan, plan.ID); err != nil {
+				return err
+			}
+		}
+	}
+	if err := a.repo.Delete(ctx, kindHealth, id); err != nil {
 		return err
 	}
 	name := a.databaseName(ctx, id)
-	if err := a.cat.Delete(ctx, kindDatabase, id); err != nil {
+	if err := a.repo.Delete(ctx, kindDatabase, id); err != nil {
 		return err
 	}
 	a.Audit(ctx, "database.delete", name)
@@ -275,7 +288,7 @@ func (a *App) CreateStorage(ctx context.Context, in Storage) (Storage, error) {
 	in.ID = uuid.NewString()
 	in.CreatedAt = time.Now().UTC()
 	in.Settings = sealed
-	if err := a.cat.Put(ctx, kindStorage, in.ID, in); err != nil {
+	if err := a.repo.Put(ctx, kindStorage, in.ID, in); err != nil {
 		return Storage{}, err
 	}
 	a.Audit(ctx, "storage.create", in.Name+" ("+in.Type+")")
@@ -289,7 +302,7 @@ func (a *App) CreateStorage(ctx context.Context, in Storage) (Storage, error) {
 
 func (a *App) ListStorages(ctx context.Context) ([]Storage, error) {
 	var rows []Storage
-	if err := a.cat.List(ctx, kindStorage, &rows); err != nil {
+	if err := a.repo.List(ctx, kindStorage, &rows); err != nil {
 		return nil, err
 	}
 	if rows == nil {
@@ -307,10 +320,10 @@ func (a *App) ListStorages(ctx context.Context) ([]Storage, error) {
 
 func (a *App) DeleteStorage(ctx context.Context, id string) error {
 	var row Storage
-	if err := a.cat.Get(ctx, kindStorage, id, &row); err != nil {
+	if err := a.repo.Get(ctx, kindStorage, id, &row); err != nil {
 		return err
 	}
-	if err := a.cat.Delete(ctx, kindStorage, id); err != nil {
+	if err := a.repo.Delete(ctx, kindStorage, id); err != nil {
 		return err
 	}
 	a.Audit(ctx, "storage.delete", row.Name)
@@ -327,9 +340,40 @@ func (a *App) TestStorage(ctx context.Context, id string) error {
 	return store.Test(ctx)
 }
 
+// ProbeStorage checks a destination from the form before it is saved.
+// When id is set, a blank secret keeps the value already stored.
+func (a *App) ProbeStorage(ctx context.Context, in Storage) error {
+	settings := in.Settings
+	kind := in.Type
+	if in.ID != "" {
+		var existing Storage
+		if err := a.repo.Get(ctx, kindStorage, in.ID, &existing); err != nil {
+			return err
+		}
+		if kind == "" {
+			kind = existing.Type
+		}
+		opened, err := a.openSettings(existing.Settings, storageSecrets)
+		if err != nil {
+			return err
+		}
+		settings, err = mergeSettings(opened, in.Settings, storageSecrets)
+		if err != nil {
+			return err
+		}
+	}
+	store, err := storage.New(kind, settings)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	return store.Test(ctx)
+}
+
 func (a *App) database(ctx context.Context, id string) (Database, error) {
 	var row Database
-	if err := a.cat.Get(ctx, kindDatabase, id, &row); err != nil {
+	if err := a.repo.Get(ctx, kindDatabase, id, &row); err != nil {
 		return Database{}, err
 	}
 	if err := a.openDatabase(&row); err != nil {
@@ -340,7 +384,7 @@ func (a *App) database(ctx context.Context, id string) (Database, error) {
 
 func (a *App) store(ctx context.Context, id string) (storage.Store, Storage, error) {
 	var row Storage
-	if err := a.cat.Get(ctx, kindStorage, id, &row); err != nil {
+	if err := a.repo.Get(ctx, kindStorage, id, &row); err != nil {
 		return nil, Storage{}, err
 	}
 	opened, err := a.openSettings(row.Settings, storageSecrets)

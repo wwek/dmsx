@@ -6,37 +6,50 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"strconv"
 
 	"dmsx/internal/sqlident"
 )
 
-// Result is what an archive run proved before it was allowed to delete rows.
+// Result is what an archive run proved. Keys lists every uploaded object.
 type Result struct {
 	Key          string
+	Keys         []string
 	MD5          string
 	RowsArchived int64
 	RowsDeleted  int64
 }
 
-// Source is a forward-only cursor. Next returns io.EOF when the cursor ends.
-type Source interface {
-	Columns(ctx context.Context) ([]Column, error)
-	Next(ctx context.Context) ([]any, error)
+const (
+	PhaseReading   = "reading"
+	PhaseUploading = "uploading"
+	PhaseVerifying = "verifying"
+	PhaseDeleting  = "deleting"
+	PhaseDone      = "done"
+)
+
+type Progress struct {
+	Phase        string
+	RowsArchived int64
+	RowsDeleted  int64
+	ObjectKey    string
+	MD5          string
+	Batch        int
 }
 
-// Destination accepts one object and can read it back. The read-back is how
-// the MD5 is confirmed: the bytes are hashed and discarded, not written to a
-// local file.
 type Destination interface {
 	Upload(ctx context.Context, key string, body io.Reader) error
 	Open(ctx context.Context, key string) (io.ReadCloser, error)
 	Exists(ctx context.Context, key string) (bool, error)
 }
 
-// Deleter removes archived rows in small batches. It is called only after the
-// remote MD5 matches.
-type Deleter interface {
-	DeleteBatches(ctx context.Context, batch int, pause func()) (int64, error)
+// Table archives one MySQL/MariaDB table in primary-key batches.
+type Table interface {
+	PrimaryKey(ctx context.Context) (PrimaryKey, error)
+	Columns(ctx context.Context) ([]Column, error)
+	FetchChunk(ctx context.Context, after []any, limit int) ([][]any, error)
+	DeleteKeys(ctx context.Context, keys [][]any) (int64, error)
+	Close()
 }
 
 type Request struct {
@@ -55,83 +68,127 @@ func (r Request) validate() error {
 	return sqlident.ValidatePredicate(r.Where)
 }
 
-// Run streams rows into a parquet writer, uploads that stream, checks the
-// remote MD5, and only then deletes. A failed check leaves the primary rows
-// in place.
-func Run(ctx context.Context, req Request, source Source, dest Destination, deleter Deleter, pause func()) (Result, error) {
+// Run archives rows in primary-key batches. Each batch is written to Parquet,
+// uploaded, checked with a remote MD5, and only then deleted by those keys.
+func Run(ctx context.Context, req Request, table Table, dest Destination, pause func(), onProgress func(Progress)) (Result, error) {
 	if err := req.validate(); err != nil {
 		return Result{}, err
 	}
 	if req.BatchSize <= 0 {
 		req.BatchSize = 5000
 	}
-	key, err := ObjectKey(req.Database, req.Table, req.Year, "")
+	pk, err := table.PrimaryKey(ctx)
 	if err != nil {
 		return Result{}, err
 	}
-	exists, err := dest.Exists(ctx, key)
+	if err := pk.validate(); err != nil {
+		return Result{}, err
+	}
+	columns, err := table.Columns(ctx)
 	if err != nil {
 		return Result{}, err
 	}
-	if exists {
-		key, err = ObjectKey(req.Database, req.Table, req.Year, Stamp())
-		if err != nil {
-			return Result{}, err
+	colIndex := map[string]int{}
+	for i, column := range columns {
+		colIndex[column.Name] = i
+	}
+	for _, name := range pk {
+		if _, ok := colIndex[name]; !ok {
+			return Result{}, fmt.Errorf("primary key column %q is not in the table", name)
 		}
 	}
-	columns, err := source.Columns(ctx)
-	if err != nil {
-		return Result{}, err
-	}
 
+	var result Result
+	var after []any
+	stamp := Stamp()
+	for batch := 1; ; batch++ {
+		if err := ctx.Err(); err != nil {
+			return result, err
+		}
+		report(onProgress, Progress{Phase: PhaseReading, RowsArchived: result.RowsArchived, RowsDeleted: result.RowsDeleted, Batch: batch})
+		rows, err := table.FetchChunk(ctx, after, req.BatchSize)
+		if err != nil {
+			return result, err
+		}
+		if len(rows) == 0 {
+			report(onProgress, Progress{Phase: PhaseDone, RowsArchived: result.RowsArchived, RowsDeleted: result.RowsDeleted, Batch: batch})
+			return result, nil
+		}
+		keys := make([][]any, len(rows))
+		for i, row := range rows {
+			keys[i], err = pk.extract(row, colIndex)
+			if err != nil {
+				return result, err
+			}
+		}
+		after = keys[len(keys)-1]
+		key, err := ObjectKey(req.Database, req.Table, req.Year, stamp+"_"+strconv.Itoa(batch))
+		if err != nil {
+			return result, err
+		}
+		report(onProgress, Progress{Phase: PhaseUploading, RowsArchived: result.RowsArchived, RowsDeleted: result.RowsDeleted, ObjectKey: key, Batch: batch})
+		digest, n, err := uploadBatch(ctx, dest, key, columns, rows)
+		if err != nil {
+			return result, err
+		}
+		report(onProgress, Progress{Phase: PhaseVerifying, RowsArchived: result.RowsArchived, RowsDeleted: result.RowsDeleted, ObjectKey: key, MD5: fmt.Sprintf("%x", digest), Batch: batch})
+		if err := verifyMD5(ctx, dest, key, digest); err != nil {
+			return result, err
+		}
+		result.Key = key
+		result.Keys = append(result.Keys, key)
+		result.MD5 = fmt.Sprintf("%x", digest)
+		result.RowsArchived += n
+		if req.DeleteAfter {
+			report(onProgress, Progress{Phase: PhaseDeleting, RowsArchived: result.RowsArchived, RowsDeleted: result.RowsDeleted, ObjectKey: key, MD5: result.MD5, Batch: batch})
+			deleted, err := table.DeleteKeys(ctx, keys)
+			result.RowsDeleted += deleted
+			if err != nil {
+				return result, fmt.Errorf("remote md5 matched but delete failed after %d rows: %w", deleted, err)
+			}
+		}
+		report(onProgress, Progress{Phase: PhaseDone, RowsArchived: result.RowsArchived, RowsDeleted: result.RowsDeleted, ObjectKey: key, MD5: result.MD5, Batch: batch})
+		if pause != nil {
+			pause()
+		}
+	}
+}
+
+func report(fn func(Progress), p Progress) {
+	if fn != nil {
+		fn(p)
+	}
+}
+
+func uploadBatch(ctx context.Context, dest Destination, key string, columns []Column, rows [][]any) ([]byte, int64, error) {
 	reader, writer := io.Pipe()
 	sum := md5.New()
 	uploadErr := make(chan error, 1)
 	go func() {
 		uploadErr <- dest.Upload(ctx, key, reader)
 	}()
-
-	var rows int64
-	writeErr := make(chan error, 1)
-	go func() {
-		defer close(writeErr)
-		n, err := WriteParquet(io.MultiWriter(writer, sum), columns, func() ([]any, error) {
-			return source.Next(ctx)
-		})
-		rows = n
-		if err != nil {
-			_ = writer.CloseWithError(err)
-			writeErr <- err
-			return
+	i := 0
+	n, writeErr := WriteParquet(io.MultiWriter(writer, sum), columns, func() ([]any, error) {
+		if i >= len(rows) {
+			return nil, io.EOF
 		}
-		writeErr <- writer.Close()
-	}()
-
+		row := rows[i]
+		i++
+		return row, nil
+	})
+	if writeErr != nil {
+		_ = writer.CloseWithError(writeErr)
+	} else {
+		writeErr = writer.Close()
+	}
 	putErr := <-uploadErr
-	bodyErr := <-writeErr
-	if bodyErr != nil {
-		return Result{}, bodyErr
+	if writeErr != nil {
+		return nil, 0, writeErr
 	}
 	if putErr != nil {
-		return Result{}, fmt.Errorf("upload %s: %w", key, putErr)
+		return nil, 0, fmt.Errorf("upload %s: %w", key, putErr)
 	}
-	digest := append([]byte(nil), sum.Sum(nil)...)
-	if err := verifyMD5(ctx, dest, key, digest); err != nil {
-		return Result{Key: key, MD5: fmt.Sprintf("%x", digest), RowsArchived: rows}, err
-	}
-	result := Result{Key: key, MD5: fmt.Sprintf("%x", digest), RowsArchived: rows}
-	if !req.DeleteAfter {
-		return result, nil
-	}
-	if deleter == nil {
-		return result, fmt.Errorf("delete was requested but no deleter was configured")
-	}
-	deleted, err := deleter.DeleteBatches(ctx, req.BatchSize, pause)
-	result.RowsDeleted = deleted
-	if err != nil {
-		return result, fmt.Errorf("remote md5 matched but delete failed after %d rows: %w", deleted, err)
-	}
-	return result, nil
+	return append([]byte(nil), sum.Sum(nil)...), n, nil
 }
 
 func verifyMD5(ctx context.Context, dest Destination, key string, want []byte) error {

@@ -26,15 +26,21 @@ type Source struct {
 	ExcludeTables    []string
 	IncludeSchemas   []string
 	ExcludeTableData []string
-	Physical         bool
-	PhysicalCodec    string
-	Parallel         int
+	Physical            bool
+	PhysicalCodec       string
+	IncrementalManifest string // local path to parent backup_manifest for PG 17+
+	SystemID            uint64
+	Parallel            int
 }
 
 type Format struct {
 	Name               string
 	Extension          string
 	CompressInPipeline bool
+	StartLSN            string
+	StopLSN             string
+	TimelineID         int
+	Manifest           []byte
 }
 
 const (
@@ -78,22 +84,27 @@ func Restore(ctx context.Context, src Source, format Format, input io.Reader) er
 }
 
 func run(ctx context.Context, bin string, args []string, env []string, stdin io.Reader, stdout io.Writer) error {
+	_, err := runCapture(ctx, bin, args, env, stdin, stdout, 16<<10)
+	return err
+}
+
+func runCapture(ctx context.Context, bin string, args []string, env []string, stdin io.Reader, stdout io.Writer, stderrMax int) (string, error) {
 	path, err := look(bin)
 	if err != nil {
-		return err
+		return "", err
 	}
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Env = append(os.Environ(), env...)
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	var stderr tail
-	stderr.max = 16 << 10
+	stderr.max = stderrMax
 	cmd.Stderr = &stderr
 	cmd.WaitDelay = 5 * time.Second
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s: %w: %s", bin, err, strings.TrimSpace(stderr.String()))
+		return stderr.String(), fmt.Errorf("%s: %w: %s", bin, err, strings.TrimSpace(stderr.String()))
 	}
-	return nil
+	return stderr.String(), nil
 }
 
 func look(name string) (string, error) {

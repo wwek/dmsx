@@ -2,19 +2,23 @@
 
 How the process is built is in [docs/architecture.md](docs/architecture.md). Product behavior for people using dmsx is in [README.md](README.md) and [README.zh-CN.md](README.zh-CN.md).
 
-Reply to the person in the language they write in. Keep identifiers, code comments, log messages and this file in English. The embedded console and the Chinese README stay Chinese.
+Reply to the person in the language they write in. Keep identifiers, code comments, log messages and this file in English. The embedded console is bilingual (zh/en); the Chinese README stays Chinese.
 
 ## Backup work
 
 Before changing whole-database backup, restore, scheduling, retention, dump tools or storage streaming, read [.agents/skills/whole-backup/SKILL.md](.agents/skills/whole-backup/SKILL.md).
 
-Implement behavior in this repository. Do not copy Databasus source into these packages. Databasus under `.local/databasus` is a reference for behavior, not a tree to vendor.
+Implement behavior in this repository. You may read Databasus under `.local/databasus` as a behavior reference, then write the dmsx code yourself. Do not copy Databasus source into these packages.
+
+The metadata repo is SQLite under `DMSX_DATA` (`internal/repo`). That is intentional; Databasus embeds PostgreSQL for its own metadata and dmsx does not follow that choice.
+
+Table archive and cold query stay on MySQL and MariaDB. S3 and Qiniu archives use the storage prefix for upload, MD5 reread, and cold query. Google Drive is refused for archive. Online DDL is `gh-ost` or `pt-online-schema-change`, and it cuts over only when the operator asks. Do not add new product behavior on those paths unless asked.
 
 ## Code
 
 - A backup byte does not get written to a staging file on the way to storage.
 - `internal/engine` does not import `internal/app` or `internal/server`.
-- Connection passwords and storage secrets stay encrypted in the catalog. API responses do not return them.
+- Connection passwords and storage secrets stay encrypted in the metadata repo. API responses do not return them.
 - A restore target's password is used for that restore and is not stored.
 - Names say what the code does. A comment is for a constraint the code cannot show.
 

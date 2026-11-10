@@ -14,10 +14,14 @@ import (
 const (
 	TypeLocal       = "LOCAL"
 	TypeS3          = "S3"
+	TypeGCS         = "GCS"
+	TypeAzure       = "AZURE_BLOB"
+	TypeOSS         = "OSS"
+	TypeSwift       = "SWIFT"
+	TypeSSH         = "SSH"
 	TypeQiniu       = "QINIU"
 	TypeSFTP        = "SFTP"
 	TypeFTP         = "FTP"
-	TypeAzure       = "AZURE_BLOB"
 	TypeGoogleDrive = "GOOGLE_DRIVE"
 	TypeNAS         = "NAS"
 	TypeRclone      = "RCLONE"
@@ -38,9 +42,15 @@ func New(kind string, settings json.RawMessage) (Store, error) {
 		return newLocal(settings)
 	case TypeS3:
 		return newS3(settings, false)
+	case TypeGCS:
+		return newS3(defaultGCS(settings), false)
+	case TypeOSS:
+		return newOSS(settings)
 	case TypeQiniu:
 		return newS3(settings, true)
-	case TypeSFTP:
+	case TypeSwift:
+		return newSwift(settings)
+	case TypeSSH, TypeSFTP:
 		return newSFTP(settings)
 	case TypeFTP:
 		return newFTP(settings)
