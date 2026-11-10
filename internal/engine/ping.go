@@ -21,7 +21,9 @@ func Ping(ctx context.Context, src Source) error {
 			return err
 		}
 		defer cnf.remove()
-		return run(ctx, bin, []string{cnf.arg(), "-e", "SELECT 1"}, nil, nil, io.Discard)
+		args := append([]string{cnf.arg()}, myClientArgs(ctx, bin, maria)...)
+		args = append(args, "-e", "SELECT 1")
+		return run(ctx, bin, args, nil, nil, io.Discard)
 	case PostgreSQL:
 		pass, err := writePGPass(src)
 		if err != nil {

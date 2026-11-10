@@ -18,7 +18,8 @@ func QueryMySQL(ctx context.Context, src Source, sql string) (string, error) {
 		return "", err
 	}
 	defer cnf.remove()
-	args := []string{cnf.arg(), "-N", "-B", "-e", sql, src.Database}
+	args := append([]string{cnf.arg()}, myClientArgs(ctx, bin, maria)...)
+	args = append(args, "-N", "-B", "-e", sql, src.Database)
 	var stdout strings.Builder
 	if err := run(ctx, bin, args, nil, nil, &stdout); err != nil {
 		return "", fmt.Errorf("%s: %s", bin, redact(err.Error(), src.Password))

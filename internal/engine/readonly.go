@@ -81,7 +81,8 @@ func createMySQLUser(ctx context.Context, src Source, user BackupUser) error {
 		"GRANT SELECT, SHOW VIEW, LOCK TABLES, TRIGGER, EVENT ON `%s`.* TO '%s'@'%%';\n"+
 		"FLUSH PRIVILEGES;\n",
 		user.Username, user.Password, src.Database, user.Username)
-	return run(ctx, bin, []string{cnf.arg()}, nil, strings.NewReader(statements), io.Discard)
+	args := append([]string{cnf.arg()}, myClientArgs(ctx, bin, maria)...)
+	return run(ctx, bin, args, nil, strings.NewReader(statements), io.Discard)
 }
 
 func createPostgresRole(ctx context.Context, src Source, user BackupUser, replication bool) error {

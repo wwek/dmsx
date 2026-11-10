@@ -24,7 +24,7 @@ func dumpMySQL(ctx context.Context, src Source, output io.Writer, maria bool) (F
 	}
 	defer cnf.remove()
 
-	base := []string{cnf.arg()}
+	base := append([]string{cnf.arg()}, myClientArgs(ctx, bin, maria)...)
 	var candidates [][]string
 	if maria || strings.HasPrefix(src.Version, "5.7") {
 		candidates = [][]string{{"--compress"}}
@@ -90,7 +90,8 @@ func restoreMySQL(ctx context.Context, src Source, input io.Reader, maria bool) 
 		return err
 	}
 	defer cnf.remove()
-	args := []string{cnf.arg(), src.Database}
+	args := append([]string{cnf.arg()}, myClientArgs(ctx, bin, maria)...)
+	args = append(args, src.Database)
 	return run(ctx, bin, args, nil, input, io.Discard)
 }
 

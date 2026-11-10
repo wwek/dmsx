@@ -449,6 +449,30 @@ func TestMySQLBackupRestoreRoundTrip(t *testing.T) {
 	if strings.Contains(string(get(t, "/api/backups/restores")), "dmsx-e2e") {
 		t.Fatal("the restore kept the target password")
 	}
+
+	// The upstream reference also proves a backup taken by a limited login.
+	// dmsx creates that login and switches the connection over to it.
+	postJSON(t, "/api/databases/"+database["id"].(string)+"/backup-user", map[string]any{"replication": false})
+	limited := postJSON(t, "/api/backups/configs/"+config["id"].(string)+"/run", nil)
+	limitedFinished := waitRun(t, limited["id"].(string))
+	if limitedFinished["status"] != "success" {
+		t.Fatalf("backup with the limited user %+v", limitedFinished)
+	}
+	mysqlExec(t, "CREATE DATABASE shop_limited")
+	limitedRestore := postJSON(t, "/api/backups/runs/"+limitedFinished["id"].(string)+"/restore", map[string]any{
+		"host": "127.0.0.1", "port": 13306, "username": "root", "password": "dmsx-e2e",
+		"database": "shop_limited", "verify": true,
+	})
+	limitedRestored := waitRestore(t, limitedRestore["id"].(string))
+	if limitedRestored["status"] != "success" {
+		t.Fatalf("restore of the limited user backup %+v", limitedRestored)
+	}
+	if rows := mysqlScalar(t, "SELECT COUNT(*) FROM shop_limited.events"); rows != "12000" {
+		t.Fatalf("restored events from the limited user backup %s", rows)
+	}
+	if rows := mysqlScalar(t, "SELECT COUNT(*) FROM shop_limited.orders"); rows != "3" {
+		t.Fatalf("restored orders from the limited user backup %s", rows)
+	}
 }
 
 func TestMySQLArchiveToS3AndColdQuery(t *testing.T) {
