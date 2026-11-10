@@ -46,6 +46,13 @@ func newS3Server(t *testing.T) *s3Server {
 
 func (s *s3Server) endpoint() string { return s.server.URL }
 
+// put stores an object under its full name, the bucket included.
+func (s *s3Server) put(name string, body []byte) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.objects[name] = s3Object{body: body, modifiedAt: time.Now().UTC().Truncate(time.Second)}
+}
+
 // trace lists the requests the endpoint answered, so a failing test can show
 // what the client actually asked for.
 func (s *s3Server) trace() []string {

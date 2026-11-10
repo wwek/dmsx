@@ -674,16 +674,42 @@ func waitDDL(t *testing.T, id string) map[string]any {
 	return nil
 }
 
+// mysqlScalar runs a query in the container and returns its last line.
+//
+// The standard output of the client is read on its own. The client writes
+// "Using a password on the command line interface can be insecure." to the
+// error output, and a query that returned no line must not report that
+// warning as its result. The call is repeated a few times because the
+// container client sometimes hands back an empty standard output.
 func mysqlScalar(t *testing.T, query string) string {
 	t.Helper()
-	cmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "-p", "dmsx-e2e", "exec", "-T", "mysql",
-		"mysql", "-uroot", "-pdmsx-e2e", "-N", "-e", query)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("mysql: %v\n%s", err, out)
+	var errOutput bytes.Buffer
+	for attempt := 0; attempt < 3; attempt++ {
+		cmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "-p", "dmsx-e2e", "exec", "-T", "mysql",
+			"mysql", "-uroot", "-pdmsx-e2e", "-N", "-e", query)
+		errOutput.Reset()
+		cmd.Stderr = &errOutput
+		out, err := cmd.Output()
+		if err != nil {
+			t.Fatalf("mysql: %v\n%s", err, errOutput.String())
+		}
+		if line := lastLine(out); line != "" {
+			return line
+		}
 	}
+	t.Fatalf("mysql returned no result for %q\n%s", query, errOutput.String())
+	return ""
+}
+
+// lastLine returns the last non-empty line of the output.
+func lastLine(out []byte) string {
 	lines := bytes.Split(bytes.TrimSpace(out), []byte("\n"))
-	return string(bytes.TrimSpace(lines[len(lines)-1]))
+	for i := len(lines) - 1; i >= 0; i-- {
+		if line := string(bytes.TrimSpace(lines[i])); line != "" {
+			return line
+		}
+	}
+	return ""
 }
 
 func mysqlExec(t *testing.T, query string) {
@@ -749,14 +775,7 @@ func waitArchive(t *testing.T, id string) map[string]any {
 
 func mysqlCount(t *testing.T) string {
 	t.Helper()
-	cmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "-p", "dmsx-e2e", "exec", "-T", "mysql",
-		"mysql", "-uroot", "-pdmsx-e2e", "-N", "-e", "SELECT COUNT(*) FROM shop.orders")
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("mysql count: %v\n%s", err, out)
-	}
-	lines := bytes.Split(bytes.TrimSpace(out), []byte("\n"))
-	return string(bytes.TrimSpace(lines[len(lines)-1]))
+	return mysqlScalar(t, "SELECT COUNT(*) FROM shop.orders")
 }
 
 var sessionCookie string
