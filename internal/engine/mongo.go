@@ -16,13 +16,7 @@ func dumpMongo(ctx context.Context, src Source, output io.Writer) (Format, error
 	if parallel > 16 {
 		parallel = 16
 	}
-	args := []string{uriArg(src), "--archive", "--gzip"}
-	for _, name := range src.ExcludeTables {
-		args = append(args, "--excludeCollection="+name)
-	}
-	if parallel > 1 {
-		args = append(args, "--numParallelCollections="+strconv.Itoa(parallel))
-	}
+	args := mongoDumpArgs(src)
 	if err := run(ctx, "mongodump", args, nil, nil, output); err != nil {
 		return Format{}, fmt.Errorf("mongodump: %s", redact(redact(err.Error(), src.Password), uriArg(src)))
 	}
@@ -30,12 +24,36 @@ func dumpMongo(ctx context.Context, src Source, output io.Writer) (Format, error
 }
 
 func restoreMongo(ctx context.Context, src Source, input io.Reader) error {
-	args := []string{uriArg(src), "--archive", "--gzip", "--drop"}
-	err := run(ctx, "mongorestore", args, nil, input, io.Discard)
+	err := run(ctx, "mongorestore", mongoRestoreArgs(src), nil, input, io.Discard)
 	if err != nil {
 		return fmt.Errorf("mongorestore: %s", redact(redact(err.Error(), src.Password), uriArg(src)))
 	}
 	return nil
+}
+
+// mongoDumpArgs are the arguments for one mongodump run. The archive goes to
+// stdout as one gzip stream.
+func mongoDumpArgs(src Source) []string {
+	args := []string{uriArg(src), "--archive", "--gzip"}
+	for _, name := range src.ExcludeTables {
+		args = append(args, "--excludeCollection="+name)
+	}
+	parallel := src.Parallel
+	if parallel < 1 {
+		parallel = 1
+	}
+	if parallel > 16 {
+		parallel = 16
+	}
+	if parallel > 1 {
+		args = append(args, "--numParallelCollections="+strconv.Itoa(parallel))
+	}
+	return args
+}
+
+// mongoRestoreArgs are the arguments for one mongorestore run.
+func mongoRestoreArgs(src Source) []string {
+	return []string{uriArg(src), "--archive", "--gzip", "--drop"}
 }
 
 func uriArg(src Source) string {

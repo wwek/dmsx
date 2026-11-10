@@ -16,6 +16,22 @@ func dumpPostgresLogical(ctx context.Context, src Source, output io.Writer) (For
 		return Format{}, err
 	}
 	defer pass.remove()
+	args := postgresDumpArgs(src)
+	env := []string{"PGPASSFILE=" + pass.path}
+	if src.SSL {
+		env = append(env, "PGSSLMODE=require")
+	} else {
+		env = append(env, "PGSSLMODE=disable")
+	}
+	if err := run(ctx, "pg_dump", args, env, nil, output); err != nil {
+		return Format{}, fmt.Errorf("pg_dump: %s", redact(err.Error(), src.Password))
+	}
+	return Format{Name: "pg-custom", Extension: ".dump", CompressInPipeline: false}, nil
+}
+
+// postgresDumpArgs are the arguments for one pg_dump run. The schema include
+// and the table exclude flags stay on the dump command.
+func postgresDumpArgs(src Source) []string {
 	args := []string{
 		"-Fc",
 		"--no-password",
@@ -34,17 +50,7 @@ func dumpPostgresLogical(ctx context.Context, src Source, output io.Writer) (For
 	for _, table := range src.ExcludeTableData {
 		args = append(args, "--exclude-table-data="+table)
 	}
-	args = append(args, postgresCompressArgs(src.Version)...)
-	env := []string{"PGPASSFILE=" + pass.path}
-	if src.SSL {
-		env = append(env, "PGSSLMODE=require")
-	} else {
-		env = append(env, "PGSSLMODE=disable")
-	}
-	if err := run(ctx, "pg_dump", args, env, nil, output); err != nil {
-		return Format{}, fmt.Errorf("pg_dump: %s", redact(err.Error(), src.Password))
-	}
-	return Format{Name: "pg-custom", Extension: ".dump", CompressInPipeline: false}, nil
+	return append(args, postgresCompressArgs(src.Version)...)
 }
 
 func postgresCompressArgs(version string) []string {

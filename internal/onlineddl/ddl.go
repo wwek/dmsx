@@ -118,20 +118,7 @@ func Run(ctx context.Context, req Request, onLine func(string)) error {
 	switch tool {
 	case "pt-osc", "pt-online-schema-change":
 		bin = "pt-online-schema-change"
-		args = []string{
-			"--alter", body,
-			"--chunk-size", strconv.Itoa(req.ChunkSize),
-			"--progress", "time,5",
-			"--nocheck-replication-filters",
-			"--recursion-method=none",
-			fmt.Sprintf("--defaults-file=%s", cnf.path),
-			fmt.Sprintf("h=%s,P=%d,D=%s,t=%s", req.Host, req.Port, database, table),
-		}
-		if req.Execute {
-			args = append([]string{"--execute"}, args...)
-		} else {
-			args = append([]string{"--dry-run"}, args...)
-		}
+		args = ptArgs(req, database, table, body, cnf.path)
 	default:
 		bin = "gh-ost"
 		dir, err := os.MkdirTemp("", "dmsx-ghost-*")
@@ -139,30 +126,7 @@ func Run(ctx context.Context, req Request, onLine func(string)) error {
 			return err
 		}
 		defer os.RemoveAll(dir)
-		args = []string{
-			"--conf=" + cnf.path,
-			"--host=" + req.Host,
-			"--port=" + strconv.Itoa(req.Port),
-			"--database=" + database,
-			"--table=" + table,
-			"--alter=" + body,
-			"--chunk-size=" + strconv.Itoa(req.ChunkSize),
-			"--exact-rowcount",
-			"--concurrent-rowcount",
-			"--allow-on-master",
-			"--assume-rbr",
-			"--initially-drop-ghost-table",
-			"--initially-drop-old-table",
-			"--serve-socket-file=" + filepath.Join(dir, "ghost.sock"),
-			"--panic-flag-file=" + filepath.Join(dir, "ghost.panic"),
-			"--verbose",
-		}
-		if req.Execute {
-			args = append(args, "--execute")
-		}
-		if req.SkipPortValidation {
-			args = append(args, "--skip-port-validation")
-		}
+		args = ghOstArgs(req, database, table, body, cnf.path, dir)
 	}
 	path, err := resolveTool(bin)
 	if err != nil {
@@ -194,6 +158,55 @@ func Run(ctx context.Context, req Request, onLine func(string)) error {
 	go scan(stderr)
 	wg.Wait()
 	return cmd.Wait()
+}
+
+// ghOstArgs are the arguments for one gh-ost run. The cut-over happens only
+// when the operator asked for it, and the password stays in the defaults
+// file that the --conf path names.
+func ghOstArgs(req Request, database, table, body, confPath, dir string) []string {
+	args := []string{
+		"--conf=" + confPath,
+		"--host=" + req.Host,
+		"--port=" + strconv.Itoa(req.Port),
+		"--database=" + database,
+		"--table=" + table,
+		"--alter=" + body,
+		"--chunk-size=" + strconv.Itoa(req.ChunkSize),
+		"--exact-rowcount",
+		"--concurrent-rowcount",
+		"--allow-on-master",
+		"--assume-rbr",
+		"--initially-drop-ghost-table",
+		"--initially-drop-old-table",
+		"--serve-socket-file=" + filepath.Join(dir, "ghost.sock"),
+		"--panic-flag-file=" + filepath.Join(dir, "ghost.panic"),
+		"--verbose",
+	}
+	if req.Execute {
+		args = append(args, "--execute")
+	}
+	if req.SkipPortValidation {
+		args = append(args, "--skip-port-validation")
+	}
+	return args
+}
+
+// ptArgs are the arguments for one pt-online-schema-change run. The tool has
+// no port validation of its own, so there is nothing to skip.
+func ptArgs(req Request, database, table, body, confPath string) []string {
+	args := []string{
+		"--alter", body,
+		"--chunk-size", strconv.Itoa(req.ChunkSize),
+		"--progress", "time,5",
+		"--nocheck-replication-filters",
+		"--recursion-method=none",
+		fmt.Sprintf("--defaults-file=%s", confPath),
+		fmt.Sprintf("h=%s,P=%d,D=%s,t=%s", req.Host, req.Port, database, table),
+	}
+	if req.Execute {
+		return append([]string{"--execute"}, args...)
+	}
+	return append([]string{"--dry-run"}, args...)
 }
 
 type confFile struct{ dir, path string }
