@@ -128,6 +128,29 @@ func TestColdQueryRejectsPostgreSQL(t *testing.T) {
 	}
 }
 
+func TestArchiveRejectsPostgreSQL(t *testing.T) {
+	application, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { application.Close() })
+	ctx := context.Background()
+	_, st := archiveFixtures(t, application)
+	pg, err := application.CreateDatabase(ctx, Database{
+		Name: "pg", Engine: "postgresql", Host: "127.0.0.1", Port: 5432,
+		Username: "postgres", Password: "x", Database: "app",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = application.StartArchive(ctx, ArchiveJob{
+		DatabaseID: pg.ID, StorageID: st.ID, Table: "orders", Where: "id < 10", Year: 2024,
+	})
+	if err == nil || !strings.Contains(err.Error(), "MySQL") {
+		t.Fatal(err)
+	}
+}
+
 func archiveFixtures(t *testing.T, application *App) (Database, Storage) {
 	t.Helper()
 	ctx := context.Background()
