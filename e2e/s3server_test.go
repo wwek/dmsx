@@ -24,9 +24,10 @@ import (
 // answers the requests the AWS SDK uploader, the MD5 reread and DuckDB httpfs
 // make, so the storage prefix path can be proven without a bucket service.
 type s3Server struct {
-	mu      sync.Mutex
-	objects map[string]s3Object
-	server  *httptest.Server
+	mu       sync.Mutex
+	objects  map[string]s3Object
+	requests []string
+	server   *httptest.Server
 }
 
 // s3Object is one stored object. The modification time belongs to the object,
@@ -45,6 +46,14 @@ func newS3Server(t *testing.T) *s3Server {
 
 func (s *s3Server) endpoint() string { return s.server.URL }
 
+// trace lists the requests the endpoint answered, so a failing test can show
+// what the client actually asked for.
+func (s *s3Server) trace() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.requests...)
+}
+
 // keys lists the object keys inside a bucket.
 func (s *s3Server) keys(bucket string) []string {
 	s.mu.Lock()
@@ -60,6 +69,9 @@ func (s *s3Server) keys(bucket string) []string {
 }
 
 func (s *s3Server) handle(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	s.requests = append(s.requests, r.Method+" "+r.URL.RequestURI())
+	s.mu.Unlock()
 	bucket, key := splitObjectPath(r.URL.Path)
 	switch {
 	case bucket == "":

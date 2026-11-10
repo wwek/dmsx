@@ -532,23 +532,23 @@ func TestMySQLArchiveToS3AndColdQuery(t *testing.T) {
 	})
 	archived := waitArchive(t, job["id"].(string))
 	if archived["status"] != "success" {
-		t.Fatalf("archive %+v", archived)
+		t.Fatalf("archive %+v\nrequests %v", archived, bucket.trace())
 	}
 	if archived["rowsArchived"].(float64) != 2 || archived["rowsDeleted"].(float64) != 2 {
-		t.Fatalf("archive counts %+v", archived)
+		t.Fatalf("archive counts %+v\nrequests %v", archived, bucket.trace())
 	}
 
 	// The upload landed under the storage prefix, and the object that was
 	// read back for the MD5 check is the one that was written.
 	keys := bucket.keys("archives")
 	if len(keys) != 1 {
-		t.Fatalf("objects %v", keys)
+		t.Fatalf("objects %v\nrequests %v", keys, bucket.trace())
 	}
 	if !strings.HasPrefix(keys[0], "dmsx/dms_archives/shop/orders/2024_archive_") || !strings.HasSuffix(keys[0], ".parquet") {
-		t.Fatalf("object key %v", keys[0])
+		t.Fatalf("object key %v\nrequests %v", keys[0], bucket.trace())
 	}
 	if left := mysqlCount(t); left != "1" {
-		t.Fatalf("rows left in mysql: %s", left)
+		t.Fatalf("rows left in mysql: %s\nrequests %v", left, bucket.trace())
 	}
 
 	// The cold query reads the same prefixed object back.
@@ -557,7 +557,7 @@ func TestMySQLArchiveToS3AndColdQuery(t *testing.T) {
 		"table": "orders", "where": "id = 1", "limit": 100,
 	})
 	if len(rows) != 1 || fmt.Sprint(rows[0]["note"]) != "old-a" {
-		t.Fatalf("cold query %#v", rows)
+		t.Fatalf("cold query %#v\nrequests %v", rows, bucket.trace())
 	}
 }
 
@@ -618,21 +618,21 @@ func TestMySQLArchiveToQiniuAndColdQuery(t *testing.T) {
 	})
 	archived := waitArchive(t, job["id"].(string))
 	if archived["status"] != "success" {
-		t.Fatalf("archive %+v", archived)
+		t.Fatalf("archive %+v\nrequests %v", archived, bucket.trace())
 	}
 	if archived["rowsArchived"].(float64) != 2 || archived["rowsDeleted"].(float64) != 2 {
-		t.Fatalf("archive counts %+v", archived)
+		t.Fatalf("archive counts %+v\nrequests %v", archived, bucket.trace())
 	}
 
 	keys := bucket.keys("qiniu-archive")
 	if len(keys) != 1 {
-		t.Fatalf("objects %v", keys)
+		t.Fatalf("objects %v\nrequests %v", keys, bucket.trace())
 	}
 	if !strings.HasPrefix(keys[0], "qi/dms_archives/shop/orders/2024_archive_") || !strings.HasSuffix(keys[0], ".parquet") {
-		t.Fatalf("object key %v", keys[0])
+		t.Fatalf("object key %v\nrequests %v", keys[0], bucket.trace())
 	}
 	if left := mysqlCount(t); left != "1" {
-		t.Fatalf("rows left in mysql: %s", left)
+		t.Fatalf("rows left in mysql: %s\nrequests %v", left, bucket.trace())
 	}
 
 	rows := postColdRows(t, "/api/cold-query", map[string]any{
@@ -640,7 +640,7 @@ func TestMySQLArchiveToQiniuAndColdQuery(t *testing.T) {
 		"table": "orders", "where": "id = 1", "limit": 100,
 	})
 	if len(rows) != 1 || fmt.Sprint(rows[0]["note"]) != "old-a" {
-		t.Fatalf("cold query %#v", rows)
+		t.Fatalf("cold query %#v\nrequests %v", rows, bucket.trace())
 	}
 }
 
