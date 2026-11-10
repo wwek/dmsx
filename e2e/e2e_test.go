@@ -61,6 +61,19 @@ func TestMySQLBackupArchiveAndColdQuery(t *testing.T) {
 	postOK(t, "/api/databases/"+database["id"].(string)+"/test", nil)
 	postOK(t, "/api/storages/"+storage["id"].(string)+"/test", nil)
 
+	// A table large enough to cross several archive batches, so the primary
+	// key cursor has to carry over from one batch to the next.
+	mysqlExec(t, `CREATE TABLE events (
+		id BIGINT NOT NULL PRIMARY KEY,
+		kind VARCHAR(32) NOT NULL,
+		amount INT NOT NULL,
+		create_time DATETIME NOT NULL
+	) ENGINE=InnoDB`)
+	mysqlExec(t, `SET SESSION cte_max_recursion_depth = 500000;
+		INSERT INTO events (id, kind, amount, create_time)
+		WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 12000)
+		SELECT n, IF(n % 2 = 0, 'even', 'odd'), n, '2024-03-01 00:00:00' FROM seq`)
+
 	config := postJSON(t, "/api/backups/configs", map[string]any{
 		"name": "nightly", "databaseId": database["id"], "storageId": storage["id"],
 		"method":    "logical",
@@ -115,11 +128,45 @@ func TestMySQLBackupArchiveAndColdQuery(t *testing.T) {
 	if rejected != http.StatusBadRequest {
 		t.Fatalf("filter status %d", rejected)
 	}
+
+	events := postJSON(t, "/api/archive/jobs", map[string]any{
+		"databaseId": database["id"], "storageId": storage["id"],
+		"table": "events", "where": "create_time < '2025-01-01'", "year": 2024,
+		"batchSize": 5000, "deleteAfter": true,
+	})
+	archivedEvents := waitArchive(t, events["id"].(string))
+	if archivedEvents["status"] != "success" {
+		t.Fatalf("archive %+v", archivedEvents)
+	}
+	if archivedEvents["rowsArchived"].(float64) != 12000 || archivedEvents["rowsDeleted"].(float64) != 12000 {
+		t.Fatalf("archive counts %+v", archivedEvents)
+	}
+	keys, _ := archivedEvents["objectKeys"].([]any)
+	if len(keys) != 3 {
+		t.Fatalf("expected one object per batch, got %d: %+v", len(keys), archivedEvents)
+	}
+	objects, err := filepath.Glob(filepath.Join(archives, "dms_archives", "shop", "events", "*.parquet"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objects) != 3 {
+		t.Fatalf("expected 3 parquet objects, got %d: %v", len(objects), objects)
+	}
+	if left := mysqlScalar(t, "SELECT COUNT(*) FROM shop.events"); left != "0" {
+		t.Fatalf("rows left in mysql: %s", left)
+	}
+	eventRows := postColdRows(t, "/api/cold-query", map[string]any{
+		"databaseId": database["id"], "storageId": storage["id"],
+		"table": "events", "where": "id = 11999", "limit": 100,
+	})
+	if len(eventRows) != 1 || fmt.Sprint(eventRows[0]["kind"]) != "odd" {
+		t.Fatalf("cold query over the batched archive %#v", eventRows)
+	}
 }
 
 func TestMySQLOnlineDDL(t *testing.T) {
-	if _, err := exec.LookPath("gh-ost"); err != nil {
-		t.Skip("gh-ost is not installed")
+	if ghOstPath() == "" {
+		t.Fatal("gh-ost is required for the online DDL test; install it or point DMSX_GH_OST at it")
 	}
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Fatal("docker is required")
@@ -179,9 +226,110 @@ func TestMySQLOnlineDDL(t *testing.T) {
 	}
 }
 
+func TestMySQLOnlineDDLCutoverOnLargeTable(t *testing.T) {
+	if ghOstPath() == "" {
+		t.Fatal("gh-ost is required for the online DDL test; install it or point DMSX_GH_OST at it")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Fatal("docker is required")
+	}
+	if err := compose("up", "-d", "--wait"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = compose("down", "-v") })
+
+	root, err := filepath.Abs("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	data := t.TempDir()
+	bin := filepath.Join(t.TempDir(), "dmsx")
+	build := exec.Command("go", "build", "-o", bin, "./cmd/dmsx")
+	build.Dir = root
+	build.Stdout, build.Stderr = os.Stdout, os.Stderr
+	if err := build.Run(); err != nil {
+		t.Fatal(err)
+	}
+	server := exec.Command(bin)
+	server.Env = append(os.Environ(), "DMSX_ADDR=127.0.0.1:18080", "DMSX_DATA="+data)
+	server.Stdout, server.Stderr = os.Stdout, os.Stderr
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = server.Process.Kill()
+		_, _ = server.Process.Wait()
+	})
+	waitHealthy(t, "http://127.0.0.1:18080/api/health")
+	sessionCookie = ""
+	signIn(t)
+
+	database := postJSON(t, "/api/databases", map[string]any{
+		"name": "shop", "engine": "mysql", "host": "127.0.0.1", "port": 13306,
+		"username": "root", "password": "dmsx-e2e", "database": "shop", "version": "8.4",
+	})
+	postOK(t, "/api/databases/"+database["id"].(string)+"/test", nil)
+
+	mysqlExec(t, `CREATE TABLE ddl_big (
+		id BIGINT NOT NULL PRIMARY KEY,
+		payload VARCHAR(64) NOT NULL,
+		created_at DATETIME NOT NULL
+	) ENGINE=InnoDB`)
+	mysqlExec(t, `SET SESSION cte_max_recursion_depth = 500000;
+		INSERT INTO ddl_big (id, payload, created_at)
+		WITH RECURSIVE seq (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 120000)
+		SELECT n, CONCAT('row-', n), '2024-01-01 00:00:00' FROM seq`)
+	if rows := mysqlScalar(t, "SELECT COUNT(*) FROM shop.ddl_big"); rows != "120000" {
+		t.Fatalf("fixture rows %s", rows)
+	}
+
+	run := postJSON(t, "/api/ddl/runs", map[string]any{
+		"databaseId": database["id"],
+		"statement":  "ALTER TABLE ddl_big ADD COLUMN extra varchar(32)",
+		"tool":       "gh-ost",
+		"chunkSize":  1000,
+		"execute":    true,
+	})
+	finished := waitDDL(t, run["id"].(string))
+	if finished["status"] != "success" {
+		t.Fatalf("ddl %+v", finished)
+	}
+	if finished["execute"] != true {
+		t.Fatalf("run was not an execute: %+v", finished)
+	}
+	if copied, _ := finished["copied"].(float64); copied < 120000 {
+		t.Fatalf("gh-ost copied %v of 120000 rows: %+v", finished["copied"], finished)
+	}
+	if column := mysqlScalar(t, "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='shop' AND table_name='ddl_big' AND column_name='extra'"); column != "1" {
+		t.Fatal("the new column is missing after the cut-over")
+	}
+	if rows := mysqlScalar(t, "SELECT COUNT(*) FROM shop.ddl_big"); rows != "120000" {
+		t.Fatalf("rows after the cut-over %s", rows)
+	}
+	if wrong := mysqlScalar(t, "SELECT COUNT(*) FROM shop.ddl_big WHERE payload <> CONCAT('row-', id)"); wrong != "0" {
+		t.Fatalf("%s rows lost their payload", wrong)
+	}
+	if ghost := mysqlScalar(t, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='shop' AND table_name='_ddl_big_gho'"); ghost != "0" {
+		t.Fatal("the ghost table was left behind")
+	}
+}
+
+// ghOstPath mirrors the lookup the server does, so the test never passes by
+// skipping a tool the server would also be missing.
+func ghOstPath() string {
+	if env := os.Getenv("DMSX_GH_OST"); env != "" {
+		return env
+	}
+	path, err := exec.LookPath("gh-ost")
+	if err != nil {
+		return ""
+	}
+	return path
+}
+
 func waitDDL(t *testing.T, id string) map[string]any {
 	t.Helper()
-	deadline := time.Now().Add(90 * time.Second)
+	deadline := time.Now().Add(180 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, row := range getArray(t, "/api/ddl/runs") {
 			if row["id"] == id && row["status"] != "running" {
@@ -204,6 +352,15 @@ func mysqlScalar(t *testing.T, query string) string {
 	}
 	lines := bytes.Split(bytes.TrimSpace(out), []byte("\n"))
 	return string(bytes.TrimSpace(lines[len(lines)-1]))
+}
+
+func mysqlExec(t *testing.T, query string) {
+	t.Helper()
+	cmd := exec.Command("docker", "compose", "-f", "docker-compose.yml", "-p", "dmsx-e2e", "exec", "-T", "mysql",
+		"mysql", "-uroot", "-pdmsx-e2e", "shop", "-e", query)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("mysql: %v\n%s", err, out)
+	}
 }
 
 func compose(args ...string) error {

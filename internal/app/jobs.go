@@ -739,6 +739,7 @@ func (a *App) executeDDL(ctx context.Context, db Database, run DDLRun, database 
 		Host: host, Port: port, User: db.Username, Password: db.Password,
 		Database: database, Statement: run.Statement, Tool: run.Tool,
 		Execute: run.Execute, ChunkSize: run.ChunkSize,
+		SkipPortValidation: portIsTranslated(ctx, db, host, port),
 	}, func(line string) {
 		if log.Len() < 64<<10 {
 			log.WriteString(line)
@@ -763,6 +764,20 @@ func (a *App) executeDDL(ctx context.Context, db Database, run DDLRun, database 
 		_ = a.repo.Put(context.WithoutCancel(ctx), kindDDL, run.ID, run)
 	})
 	a.finishDDL(ctx, run, err)
+}
+
+// portIsTranslated reports whether the port dmsx connects on is not the port
+// the server reports. A port mapping, a proxy or a tunnel always translates
+// it, and gh-ost refuses to start on that difference.
+func portIsTranslated(ctx context.Context, db Database, host string, port int) bool {
+	serverPort, err := engine.ServerPort(ctx, engine.Source{
+		Engine: db.Engine, Host: host, Port: port,
+		User: db.Username, Password: db.Password, Database: db.Database,
+	})
+	if err != nil {
+		return false
+	}
+	return serverPort != port
 }
 
 func (a *App) finishDDL(ctx context.Context, run DDLRun, err error) {

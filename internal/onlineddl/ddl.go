@@ -28,6 +28,10 @@ type Request struct {
 	Tool      string
 	Execute   bool
 	ChunkSize int
+	// SkipPortValidation drops gh-ost's check that the port it connected on
+	// is the port the server reports. The check cannot hold behind a port
+	// mapping, a proxy or a tunnel.
+	SkipPortValidation bool
 }
 
 type Progress struct {
@@ -155,6 +159,9 @@ func Run(ctx context.Context, req Request, onLine func(string)) error {
 		}
 		if req.Execute {
 			args = append(args, "--execute")
+		}
+		if req.SkipPortValidation {
+			args = append(args, "--skip-port-validation")
 		}
 	}
 	path, err := resolveTool(bin)
