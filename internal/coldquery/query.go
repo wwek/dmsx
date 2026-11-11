@@ -40,10 +40,13 @@ func Query(ctx context.Context, req Request) ([]Row, error) {
 	if req.Limit <= 0 || req.Limit > 100 {
 		req.Limit = 100
 	}
+	var predicate sqlident.Predicate
 	if strings.TrimSpace(req.Where) != "" {
-		if err := sqlident.ValidatePredicate(req.Where); err != nil {
+		parsed, err := sqlident.ParsePredicate(req.Where)
+		if err != nil {
 			return nil, err
 		}
+		predicate = parsed
 	}
 	glob, err := sourceGlob(req)
 	if err != nil {
@@ -61,8 +64,8 @@ func Query(ctx context.Context, req Request) ([]Row, error) {
 		}
 	}
 	statement := "SELECT * FROM read_parquet(" + sqlString(glob) + ")"
-	if strings.TrimSpace(req.Where) != "" {
-		statement += " WHERE " + req.Where
+	if !predicate.Empty() {
+		statement += " WHERE " + predicate.ANSI()
 	}
 	statement += fmt.Sprintf(" LIMIT %d", req.Limit)
 	rows, err := db.QueryContext(ctx, statement)

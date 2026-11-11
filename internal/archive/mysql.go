@@ -24,7 +24,8 @@ type MySQLTable struct {
 }
 
 func OpenMySQL(ctx context.Context, user, password, host string, port int, database, table, where string) (*MySQLTable, error) {
-	if err := sqlident.ValidatePredicate(where); err != nil {
+	predicate, err := sqlident.ParsePredicate(where)
+	if err != nil {
 		return nil, err
 	}
 	if !sqlident.Valid(table) {
@@ -44,7 +45,7 @@ func OpenMySQL(ctx context.Context, user, password, host string, port int, datab
 		return nil, err
 	}
 	db.SetMaxOpenConns(4)
-	t := &MySQLTable{db: db, database: database, table: table, where: where}
+	t := &MySQLTable{db: db, database: database, table: table, where: predicate.MySQL()}
 	if err := t.loadMeta(ctx); err != nil {
 		db.Close()
 		return nil, err

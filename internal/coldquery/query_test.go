@@ -64,3 +64,34 @@ func TestLocalParquetQuery(t *testing.T) {
 		t.Fatal("unsafe filter was accepted")
 	}
 }
+
+// The filter of a cold query must not be able to read a file outside the
+// archive, and it must not be able to read the settings of the session,
+// which carry the storage secret.
+func TestQueryRejectsFiltersThatReachOutsideTheArchive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "2024_archive.parquet")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	filters := []string{
+		"note = (SELECT note FROM parquet_scan('/etc/passwd'))",
+		"note = (select note from parquet_scan('/etc/passwd'))",
+		"parquet_scan('/etc/passwd')",
+		"duckdb_settings()",
+		"current_setting('s3_secret_access_key')",
+		"note = current_setting('s3_secret_access_key')",
+		"read_parquet('/etc/passwd')",
+		"note = abs(-1)",
+		"note = (SELECT 1)",
+	}
+	for _, filter := range filters {
+		if _, err := Query(context.Background(), Request{Database: "shop", Table: "orders", Where: filter, LocalGlob: path}); err == nil {
+			t.Fatalf("%q was accepted", filter)
+		}
+	}
+}

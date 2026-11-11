@@ -5,7 +5,6 @@ package sqlident
 
 import (
 	"fmt"
-	"strings"
 	"unicode"
 )
 
@@ -30,31 +29,4 @@ func QuoteMySQL(name string) (string, error) {
 		return "", fmt.Errorf("invalid identifier %q", name)
 	}
 	return "`" + name + "`", nil
-}
-
-// ValidatePredicate accepts the filter an operator typed for an archive or a
-// cold query. It is not a SQL parser. It rejects statement breaks, comments,
-// and the verbs that would turn the filter into a second statement or a file
-// read. The database user is still the privilege boundary.
-func ValidatePredicate(predicate string) error {
-	text := strings.TrimSpace(predicate)
-	if text == "" {
-		return fmt.Errorf("filter is empty")
-	}
-	if len(text) > 4000 {
-		return fmt.Errorf("filter is longer than 4000 characters")
-	}
-	lower := strings.ToLower(text)
-	banned := []string{
-		";", "--", "/*", "*/", "#",
-		"read_", "copy ", "attach", "install", "load ", "pragma",
-		"set ", "call ", " into ", "outfile", "dumpfile", "sleep(", "benchmark(",
-		"union", "information_schema", "mysql.", "performance_schema",
-	}
-	for _, word := range banned {
-		if strings.Contains(lower, word) {
-			return fmt.Errorf("filter contains %q, which is not allowed", word)
-		}
-	}
-	return nil
 }
