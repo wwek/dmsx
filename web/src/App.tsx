@@ -7,6 +7,7 @@ import { useI18n } from './i18n'
 import { AppLayout } from './layouts/AppLayout'
 import { AuthGate } from './layouts/AuthGate'
 import { act } from './lib/format'
+import { errorMessage } from './lib/load'
 import { AuditPage, DatabasesPage, NotifiersPage, OverviewPage, StoragesPage } from './pages'
 
 export default function App() {
@@ -15,16 +16,18 @@ export default function App() {
   const [section, setSection] = useState<Section>('overview')
   const [collapsed, setCollapsed] = useState(false)
   const [gateError, setGateError] = useState('')
-  const { appData, refresh, healthOf } = useAppData(session, section)
+  const { appData, refresh, healthOf, error, load } = useAppData(session)
 
   useEffect(() => {
     api<Session>('/api/session')
       .then(async (next) => {
         setSession(next)
-        if (next.authenticated) await refresh()
+        // A failed first load is shown by the layout, so the console does not
+        // look like a machine without data.
+        if (next.authenticated) await load()
       })
-      .catch((err) => setGateError(err.message))
-  }, [refresh])
+      .catch((err) => setGateError(errorMessage(err)))
+  }, [load])
 
   if (!session) {
     return (
@@ -40,7 +43,8 @@ export default function App() {
         session={session}
         onAuthenticated={async () => {
           setSession((current) => ({ configured: true, authenticated: true, version: current?.version }))
-          await refresh()
+          // The first load after the password has to show its failure too.
+          await load()
         }}
       />
     )
@@ -52,6 +56,7 @@ export default function App() {
       onSection={setSection}
       collapsed={collapsed}
       onToggleCollapsed={() => setCollapsed((value) => !value)}
+      error={error}
       onLogout={() =>
         act(async () => {
           await api('/api/session', { method: 'DELETE' })

@@ -4,6 +4,7 @@ const en: Messages = {
   app: {
     brand: 'dmsx',
     loading: 'Loading…',
+    loadFailed: 'The data could not be loaded:',
     localService: 'Local service',
     collapse: 'Collapse',
     appearance: 'Appearance',

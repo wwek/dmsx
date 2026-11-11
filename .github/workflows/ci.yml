@@ -31,6 +31,7 @@ jobs:
         run: |
           cd web
           npm ci --cache ../.local/npm-cache
+          npm test
           npm run build
       - name: the console bundle has to match the source
         run: |

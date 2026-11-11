@@ -4,6 +4,7 @@ export type Messages = {
   app: {
     brand: string
     loading: string
+    loadFailed: string
     localService: string
     collapse: string
     appearance: string

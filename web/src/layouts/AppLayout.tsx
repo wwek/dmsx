@@ -15,6 +15,9 @@ type Props = {
   onLogout: () => void
   onPasswordChanged: () => void
   version: string
+  // error is the message of the last failed load. It is shown above the page,
+  // so a failed load does not look like a machine without data.
+  error?: string
   children: ReactNode
 }
 
@@ -26,6 +29,7 @@ export function AppLayout({
   onLogout,
   onPasswordChanged,
   version,
+  error,
   children,
 }: Props) {
   const { t } = useI18n()
@@ -120,7 +124,14 @@ export function AppLayout({
             </div>
           </div>
         </header>
-        <div className="view">{children}</div>
+        <div className="view">
+          {error ? (
+            <p className="alert" role="alert">
+              {t.app.loadFailed} {error}
+            </p>
+          ) : null}
+          {children}
+        </div>
       </main>
     </div>
   )

@@ -1,3 +1,5 @@
+import { errorMessage } from './load'
+
 export function formatBytes(bytes?: number) {
   if (!bytes) return '0 B'
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
@@ -21,6 +23,6 @@ export async function act(fn: () => Promise<void>) {
   try {
     await fn()
   } catch (err) {
-    alert(err instanceof Error ? err.message : String(err))
+    alert(errorMessage(err))
   }
 }

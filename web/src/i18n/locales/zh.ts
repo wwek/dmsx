@@ -4,6 +4,7 @@ const zh: Messages = {
   app: {
     brand: 'dmsx',
     loading: '加载中…',
+    loadFailed: '数据加载失败：',
     localService: '本机服务',
     collapse: '折叠',
     appearance: '外观',
