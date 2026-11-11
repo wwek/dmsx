@@ -8,14 +8,12 @@ import (
 	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 type Request struct {
@@ -133,30 +131,29 @@ func Run(ctx context.Context, req Request, onLine func(string)) error {
 		return err
 	}
 	cmd := exec.CommandContext(ctx, path, args...)
-	stdout, err := cmd.StdoutPipe()
+	// The tool writes to its standard output and to its error output, and
+	// both go into one pipe. One reader then hands the lines to the caller
+	// one after the other, so the caller does not have to guard what it
+	// does with them.
+	reader, writer, err := os.Pipe()
 	if err != nil {
 		return err
 	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return err
-	}
+	defer reader.Close()
+	cmd.Stdout = writer
+	cmd.Stderr = writer
 	if err := cmd.Start(); err != nil {
+		writer.Close()
 		return err
 	}
-	var wg sync.WaitGroup
-	wg.Add(2)
-	scan := func(r io.Reader) {
-		defer wg.Done()
-		scanner := bufio.NewScanner(r)
-		scanner.Buffer(make([]byte, 64<<10), 1<<20)
-		for scanner.Scan() {
-			onLine(scanner.Text())
-		}
+	// The tool holds its own end of the pipe. This end is closed so that the
+	// reader sees the end of the output when the tool is done.
+	writer.Close()
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	for scanner.Scan() {
+		onLine(scanner.Text())
 	}
-	go scan(stdout)
-	go scan(stderr)
-	wg.Wait()
 	return cmd.Wait()
 }
 
