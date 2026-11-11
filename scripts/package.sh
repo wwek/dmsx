@@ -42,6 +42,19 @@ fi
 
 cp "$src" "$root/internal/onlineddl/gh-ost"
 mkdir -p "$root/dist"
+
+# The console is built from web/src, so the release carries the bundle of the
+# current source and not the one that happened to be committed.
+if ! command -v npm >/dev/null 2>&1; then
+	echo "npm is required to build the console" >&2
+	exit 1
+fi
+(
+	cd "$root/web"
+	npm ci --cache "$root/.local/npm-cache"
+	npm run build
+)
+
 (
 	cd "$root"
 	release=$(git -C "$root" describe --tags --always --dirty 2>/dev/null || echo dev)
