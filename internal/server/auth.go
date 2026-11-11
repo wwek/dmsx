@@ -159,7 +159,7 @@ func registerSession(r gin.IRoutes, application *app.App, store *sessions) {
 	})
 	r.PUT("/api/session/password", func(c *gin.Context) {
 		var body struct {
-			Current string `json:"current"`
+			Current  string `json:"current"`
 			Password string `json:"password"`
 		}
 		if !bindJSON(c, &body) {

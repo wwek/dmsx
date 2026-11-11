@@ -25,8 +25,8 @@ type Segment struct {
 	Size       int64
 }
 
-func IsPartial(name string) bool      { return strings.HasSuffix(name, ".partial") }
-func IsHistory(name string) bool      { return strings.HasSuffix(name, ".history") }
+func IsPartial(name string) bool { return strings.HasSuffix(name, ".partial") }
+func IsHistory(name string) bool { return strings.HasSuffix(name, ".history") }
 func IsComplete(path string, size int64) bool {
 	info, err := os.Stat(path)
 	return err == nil && !info.IsDir() && info.Size() == size

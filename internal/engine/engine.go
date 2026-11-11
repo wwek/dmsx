@@ -13,19 +13,19 @@ import (
 )
 
 type Source struct {
-	Engine           string
-	Host             string
-	Port             int
-	User             string
-	Password         string
-	Database         string
-	SSL              bool
-	Version          string
-	IncludeTriggers  bool
-	IncludeEvents    bool
-	ExcludeTables    []string
-	IncludeSchemas   []string
-	ExcludeTableData []string
+	Engine              string
+	Host                string
+	Port                int
+	User                string
+	Password            string
+	Database            string
+	SSL                 bool
+	Version             string
+	IncludeTriggers     bool
+	IncludeEvents       bool
+	ExcludeTables       []string
+	IncludeSchemas      []string
+	ExcludeTableData    []string
 	Physical            bool
 	PhysicalCodec       string
 	IncrementalManifest string // local path to parent backup_manifest for PG 17+
@@ -37,8 +37,8 @@ type Format struct {
 	Name               string
 	Extension          string
 	CompressInPipeline bool
-	StartLSN            string
-	StopLSN             string
+	StartLSN           string
+	StopLSN            string
 	TimelineID         int
 	Manifest           []byte
 }

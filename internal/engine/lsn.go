@@ -14,8 +14,8 @@ var (
 
 // PhysicalLSN is parsed from pg_basebackup verbose stderr.
 type PhysicalLSN struct {
-	StartLSN    string
-	StopLSN     string
+	StartLSN   string
+	StopLSN    string
 	TimelineID int
 }
 

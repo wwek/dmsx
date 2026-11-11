@@ -111,8 +111,8 @@ func discoverPrimaryKey(ctx context.Context, db *sql.DB, database, table string)
 }
 
 func (t *MySQLTable) PrimaryKey(context.Context) (PrimaryKey, error) { return t.pk, nil }
-func (t *MySQLTable) Columns(context.Context) ([]Column, error)       { return t.cols, nil }
-func (t *MySQLTable) Close()                                          { _ = t.db.Close() }
+func (t *MySQLTable) Columns(context.Context) ([]Column, error)      { return t.cols, nil }
+func (t *MySQLTable) Close()                                         { _ = t.db.Close() }
 
 func (t *MySQLTable) FetchChunk(ctx context.Context, after []any, limit int) ([][]any, error) {
 	if limit <= 0 {
