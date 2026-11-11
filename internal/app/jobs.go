@@ -267,10 +267,6 @@ func (a *App) applyRetention(ctx context.Context, cfg BackupConfig) {
 		items = append(items, retention.Item{ID: id, CreatedAt: run.StartedAt, Bytes: run.Bytes})
 		byID[run.ID] = run
 	}
-	store, _, err := a.store(ctx, cfg.StorageID)
-	if err != nil {
-		return
-	}
 	expired := map[uuid.UUID]bool{}
 	for _, id := range cfg.Retention.Expired(time.Now().UTC(), items) {
 		expired[id] = true
@@ -286,12 +282,44 @@ func (a *App) applyRetention(ctx context.Context, cfg BackupConfig) {
 	}
 	for id := range expired {
 		run := byID[id.String()]
-		_ = store.Delete(ctx, run.FileName)
-		if run.ManifestKey != "" {
-			_ = store.Delete(ctx, run.ManifestKey)
+		if err := a.deleteObjects(ctx, run.StorageID, run.FileName, run.ManifestKey); err != nil {
+			// The object stays in the storage, so the run stays in the repo.
+			// The error is kept on the run and the deletion is tried again
+			// with the next pass.
+			run.Error = "the stored object was not deleted: " + err.Error()
+			_ = a.repo.Put(ctx, kindRun, run.ID, run)
+			continue
 		}
 		_ = a.repo.Delete(ctx, kindRun, run.ID)
 	}
+}
+
+// deleteObjects removes the given keys from a storage. A key that is not in
+// the storage is not an error. The caller keeps the metadata row when the
+// call fails, so the deletion can be tried again later.
+func (a *App) deleteObjects(ctx context.Context, storageID string, keys ...string) error {
+	var wanted []string
+	for _, key := range keys {
+		if key != "" {
+			wanted = append(wanted, key)
+		}
+	}
+	if len(wanted) == 0 {
+		return nil
+	}
+	store, _, err := a.store(ctx, storageID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return nil
+		}
+		return err
+	}
+	for _, key := range wanted {
+		if err := store.Delete(ctx, key); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (a *App) OpenRun(ctx context.Context, id string) (io.ReadCloser, string, error) {
@@ -849,15 +877,9 @@ func (a *App) DeleteRun(ctx context.Context, id string) error {
 	if run.Status == "running" {
 		return fmt.Errorf("backup is running")
 	}
-	if run.FileName != "" || run.ManifestKey != "" {
-		if store, _, err := a.store(ctx, run.StorageID); err == nil {
-			if run.FileName != "" {
-				_ = store.Delete(ctx, run.FileName)
-			}
-			if run.ManifestKey != "" {
-				_ = store.Delete(ctx, run.ManifestKey)
-			}
-		}
+	if err := a.deleteObjects(ctx, run.StorageID, run.FileName, run.ManifestKey); err != nil {
+		// The object stays in the storage, so the run stays in the repo.
+		return fmt.Errorf("the stored object was not deleted: %w", err)
 	}
 	if err := a.repo.Delete(ctx, kindRun, id); err != nil {
 		return err
