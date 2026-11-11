@@ -248,6 +248,33 @@ func (a *App) DeleteDatabase(ctx context.Context, id string) error {
 			}
 		}
 	}
+	jobs, err := a.ListArchives(ctx)
+	if err != nil {
+		return err
+	}
+	for _, job := range jobs {
+		if job.DatabaseID != id {
+			continue
+		}
+		if err := a.deleteObjects(ctx, job.StorageID, append(job.ObjectKeys, job.ObjectKey)...); err != nil {
+			return err
+		}
+		if err := a.repo.Delete(ctx, kindArchive, job.ID); err != nil {
+			return err
+		}
+	}
+	segments, err := a.ListWalSegments(ctx, id)
+	if err != nil {
+		return err
+	}
+	for _, segment := range segments {
+		if err := a.deleteObjects(ctx, segment.StorageID, segment.ObjectKey); err != nil {
+			return err
+		}
+		if err := a.repo.Delete(ctx, kindWalSegment, segment.ID); err != nil {
+			return err
+		}
+	}
 	if err := a.repo.Delete(ctx, kindHealth, id); err != nil {
 		return err
 	}
