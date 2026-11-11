@@ -21,6 +21,7 @@ Table archive and cold query stay on MySQL and MariaDB. S3 and Qiniu archives us
 - Connection passwords and storage secrets stay encrypted in the metadata repo. API responses do not return them.
 - A restore target's password is used for that restore and is not stored.
 - Names say what the code does. A comment is for a constraint the code cannot show.
+- The console source is `web/`. `internal/server/ui/` is its build output, not hand-written. After changing `web/src`, rebuild it with `npm run build` in `web/` and commit the result, so the embedded bytes never drift from the source.
 
 ## Checks
 
