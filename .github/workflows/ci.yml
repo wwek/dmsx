@@ -32,4 +32,15 @@ jobs:
           go-version-file: go.mod
           cache: true
       - run: sudo apt-get update && sudo apt-get install -y default-mysql-client
+      - name: install gh-ost
+        run: |
+          set -euo pipefail
+          version=1.1.11
+          base="https://github.com/github/gh-ost/releases/download/v${version}"
+          curl -fsSL -o gh-ost.tar.gz "${base}/gh-ost-linux-amd64.tar.gz"
+          curl -fsSL -o SHA256SUMS "${base}/SHA256SUMS"
+          grep 'gh-ost-linux-amd64.tar.gz' SHA256SUMS | sha256sum -c -
+          tar -xzf gh-ost.tar.gz gh-ost
+          sudo install -m 0755 gh-ost /usr/local/bin/gh-ost
+          gh-ost --version
       - run: go test -tags e2e -count=1 -timeout 15m ./e2e
