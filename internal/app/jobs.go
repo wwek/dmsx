@@ -653,6 +653,9 @@ func (a *App) ColdQuery(ctx context.Context, in ColdRequest) ([]coldquery.Row, e
 	if db.Engine != engine.MySQL && db.Engine != engine.MariaDB {
 		return nil, fmt.Errorf("cold query reads MySQL or MariaDB archives")
 	}
+	if !sqlident.Valid(in.Table) {
+		return nil, fmt.Errorf("table name must be a plain identifier")
+	}
 	store, row, err := a.store(ctx, in.StorageID)
 	if err != nil {
 		return nil, err
