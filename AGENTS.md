@@ -25,3 +25,7 @@ Table archive and cold query stay on MySQL and MariaDB. S3 and Qiniu archives us
 ## Checks
 
 For a Go change, run `go test ./...`. The `e2e` package is behind the `e2e` build tag and needs Docker. Do not start it unless the change is about a live MySQL backup, archive or cold query.
+
+Local runs keep the metadata repo and the local storage under `e2e/.local/`, which `.gitignore` already excludes. Do not put dmsx data under `/tmp`.
+
+Every file a run creates stays inside this repository. Use `.local/` at the repository root, or `e2e/.local/` for e2e scratch space; both are already excluded by `.gitignore`. The metadata repo, local storage, scratch data, build output and logs all belong there. Do not write anything under `/tmp` or outside the repository.
