@@ -55,8 +55,10 @@ type Item struct {
 	Bytes     int64
 }
 
-// OverTotal returns the oldest items that push the stored total past maxBytes.
-// The newest item is always kept, even when it alone is larger than the cap.
+// OverTotal returns the items that do not fit under maxBytes. The newest item
+// is always kept, even when it alone is larger than the cap. The total counts
+// the items that are kept, so an item that does not fit does not push the
+// items after it out of the cap.
 func OverTotal(maxBytes int64, items []Item) []uuid.UUID {
 	if maxBytes <= 0 || len(items) == 0 {
 		return nil
@@ -66,10 +68,11 @@ func OverTotal(maxBytes int64, items []Item) []uuid.UUID {
 	total := newest[0].Bytes
 	var drop []uuid.UUID
 	for _, item := range newest[1:] {
-		total += item.Bytes
-		if total > maxBytes {
+		if total+item.Bytes > maxBytes {
 			drop = append(drop, item.ID)
+			continue
 		}
+		total += item.Bytes
 	}
 	return drop
 }

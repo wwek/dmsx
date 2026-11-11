@@ -49,6 +49,23 @@ func TestOverTotalDropsOldestPastTheCap(t *testing.T) {
 	}
 }
 
+// An item that does not fit is dropped, and the items after it are measured
+// against the total of the items that are kept. A backup that still fits
+// behind the dropped one has to stay.
+func TestOverTotalCountsOnlyTheItemsThatAreKept(t *testing.T) {
+	now := time.Date(2024, 6, 1, 0, 0, 0, 0, time.UTC)
+	newest, middle, oldest := uuid.New(), uuid.New(), uuid.New()
+	items := []Item{
+		{ID: newest, CreatedAt: now, Bytes: 60 << 20},
+		{ID: middle, CreatedAt: now.Add(-time.Hour), Bytes: 50 << 20},
+		{ID: oldest, CreatedAt: now.Add(-2 * time.Hour), Bytes: 10 << 20},
+	}
+	drop := OverTotal(100<<20, items)
+	if len(drop) != 1 || drop[0] != middle {
+		t.Fatalf("drop = %v, want only the middle one", drop)
+	}
+}
+
 func TestGFSKeepsOnePerDay(t *testing.T) {
 	now := time.Date(2024, 6, 3, 18, 0, 0, 0, time.UTC)
 	keepToday := uuid.New()
