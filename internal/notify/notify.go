@@ -75,8 +75,9 @@ const (
 )
 
 // SecretFields are the settings keys that are sealed in the metadata repo and blanked
-// in API responses. A chat webhook URL authorizes the post by itself.
-var SecretFields = []string{"password", "botToken", "webhookUrl", "proxyUrl", "headers"}
+// in API responses. A chat webhook URL authorizes the post by itself, and so does
+// the url of a webhook the operator runs, because it often carries a token.
+var SecretFields = []string{"password", "botToken", "webhookUrl", "proxyUrl", "headers", "url"}
 
 type Sender interface {
 	Send(ctx context.Context, msg Message) error
